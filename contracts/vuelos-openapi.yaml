@@ -1,0 +1,1759 @@
+openapi: 3.0.3
+info:
+  title: GDS Flight Core API
+  description: Microservicio centralizado para búsqueda, ofertas, retención, reservas, emisión de tickets y postventa de vuelos.
+    El dueño de la reserva (ownerId) se infiere del sub del token JWT. La lógica de pagos, autenticación 3DS, reembolsos,
+    facturación y gestión de clientes pertenece a otros dominios/APIs. Esta API únicamente recibe referencias de pago cuando
+    una operación requiere acreditar un pago.
+  version: 1.5.0.0
+  contact:
+    name: Alejandro Sebastián Flores Lugmaña
+    email: alejandro.floreslu@outlook.com
+servers:
+- url: https://api.booking-hub.com/flights/v1
+  description: Producción
+- url: https://sandbox.api.booking-hub.com/flights/v1
+  description: Sandbox
+security:
+- OAuth2Security: []
+tags:
+- name: Búsqueda y Catálogo
+- name: Bloqueo de Cupos (Hold)
+- name: Reservas y Emisión
+- name: Postventa (Maletas, Fechas y Cancelaciones)
+- name: Check-in y Boarding Pass
+- name: Estado de Vuelos
+- name: Webhooks
+paths:
+  /search:
+    post:
+      tags:
+      - Búsqueda y Catálogo
+      summary: Búsqueda de vuelos (Multidestino)
+      security: []
+      parameters:
+      - name: X-Device-Fingerprint
+        in: header
+        required: true
+        schema:
+          type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SearchRequest'
+      responses:
+        '200':
+          description: Ofertas de vuelos encontradas
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SearchResponse'
+        '400':
+          $ref: '#/components/responses/ProblemDetails400'
+        '429':
+          $ref: '#/components/responses/ProblemDetails429'
+  /offers/{offerId}/seatmap:
+    get:
+      tags:
+      - Búsqueda y Catálogo
+      summary: Obtener mapa de asientos por segmento
+      security: []
+      parameters:
+      - name: offerId
+        in: path
+        required: true
+        schema:
+          type: string
+      - name: segmentId
+        in: query
+        required: true
+        schema:
+          type: string
+      responses:
+        '200':
+          description: Mapa de asientos (gratuito al emitir, sin precios)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SeatMapResponse'
+        '404':
+          $ref: '#/components/responses/ProblemDetails404'
+        '429':
+          $ref: '#/components/responses/ProblemDetails429'
+  /offers/hold:
+    post:
+      tags:
+      - Bloqueo de Cupos (Hold)
+      summary: Bloquear inventario
+      security:
+      - OAuth2Security:
+        - flights:hold
+      parameters:
+      - name: Idempotency-Key
+        in: header
+        required: true
+        schema:
+          type: string
+          format: uuid
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/HoldRequest'
+      responses:
+        '201':
+          description: Inventario retenido. Devuelve precio congelado.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HoldResponse'
+        '400':
+          $ref: '#/components/responses/ProblemDetails400'
+        '409':
+          $ref: '#/components/responses/ProblemDetails409'
+        '422':
+          $ref: '#/components/responses/ProblemDetails422'
+  /offers/hold/{holdId}:
+    get:
+      tags:
+      - Bloqueo de Cupos (Hold)
+      summary: Consultar estado de un hold
+      security:
+      - OAuth2Security:
+        - flights:read
+      parameters:
+      - name: holdId
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      responses:
+        '200':
+          description: Estado del hold (HELD, RELEASED, EXPIRED, CONSUMED)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HoldStatusResponse'
+        '404':
+          $ref: '#/components/responses/ProblemDetails404'
+    delete:
+      tags:
+      - Bloqueo de Cupos (Hold)
+      summary: Liberar hold anticipadamente
+      security:
+      - OAuth2Security:
+        - flights:hold
+      parameters:
+      - name: holdId
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      responses:
+        '204':
+          description: Liberado exitosamente
+        '404':
+          $ref: '#/components/responses/ProblemDetails404'
+  /bookings:
+    get:
+      tags:
+      - Reservas y Emisión
+      summary: Listar reservas del usuario actual (Paginado)
+      security:
+      - OAuth2Security:
+        - flights:read
+      parameters:
+      - name: pnr
+        in: query
+        schema:
+          type: string
+      - name: status
+        in: query
+        schema:
+          type: string
+      - name: createdFrom
+        in: query
+        schema:
+          type: string
+          format: date
+      - name: createdTo
+        in: query
+        schema:
+          type: string
+          format: date
+      - name: limit
+        in: query
+        schema:
+          type: integer
+          maximum: 50
+          default: 10
+      - name: cursor
+        in: query
+        schema:
+          type: string
+      responses:
+        '200':
+          description: Lista resumida
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BookingListResponse'
+    post:
+      tags:
+      - Reservas y Emisión
+      summary: Crear reserva y gestionar emisión de ticket
+      description: El ownerId/customerId se extrae exclusivamente del JWT y no es aceptado como dato controlado por el cliente.
+        La API utiliza paymentReference como referencia a un pago gestionado por la Payment API. Esta API no procesa tarjetas,
+        3DS, autorización ni captura. La emisión del ticket puede ser síncrona o asíncrona.
+      security:
+      - OAuth2Security:
+        - flights:book
+      parameters:
+      - name: Idempotency-Key
+        in: header
+        required: true
+        schema:
+          type: string
+          format: uuid
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/BookingRequest'
+      responses:
+        '201':
+          description: Reserva creada y ticket emitido correctamente.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BookingDetail'
+        '202':
+          description: Reserva creada; pago o emisión de ticket continúa de forma asíncrona.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BookingDetail'
+        '400':
+          $ref: '#/components/responses/ProblemDetails400'
+        '409':
+          $ref: '#/components/responses/ProblemDetails409'
+        '410':
+          $ref: '#/components/responses/ProblemDetails410'
+        '422':
+          $ref: '#/components/responses/ProblemDetails422'
+  /bookings/{bookingId}:
+    get:
+      tags:
+      - Reservas y Emisión
+      summary: Detalle completo de reserva
+      security:
+      - OAuth2Security:
+        - flights:read
+      parameters:
+      - name: bookingId
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      responses:
+        '200':
+          description: Detalle de reserva (itinerarios, pasajeros, historial)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BookingDetail'
+        '404':
+          $ref: '#/components/responses/ProblemDetails404'
+  /bookings/{bookingId}/baggage-options:
+    get:
+      tags:
+      - Postventa (Maletas, Fechas y Cancelaciones)
+      summary: Opciones de equipaje post-emisión
+      security:
+      - OAuth2Security:
+        - flights:read
+      parameters:
+      - name: bookingId
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      responses:
+        '200':
+          description: Tarifas y límites de maletas
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BaggageOptionsResponse'
+  /bookings/{bookingId}/baggage:
+    post:
+      tags:
+      - Postventa (Maletas, Fechas y Cancelaciones)
+      summary: Agregar maleta extra post-emisión
+      security:
+      - OAuth2Security:
+        - flights:book
+      parameters:
+      - name: bookingId
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      - name: Idempotency-Key
+        in: header
+        required: true
+        schema:
+          type: string
+          format: uuid
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AddBaggageRequest'
+      responses:
+        '200':
+          description: Maleta agregada
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BaggageAddedResponse'
+        '202':
+          description: Procesando con el GDS
+        '409':
+          $ref: '#/components/responses/ProblemDetails409'
+  /bookings/{bookingId}/date-change/search:
+    post:
+      tags:
+      - Postventa (Maletas, Fechas y Cancelaciones)
+      summary: Buscar disponibilidad para cambio de fecha
+      security:
+      - OAuth2Security:
+        - flights:read
+      parameters:
+      - name: bookingId
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/DateChangeSearchRequest'
+      responses:
+        '200':
+          description: Opciones de cambio
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DateChangeSearchResponse'
+        '409':
+          $ref: '#/components/responses/ProblemDetails409'
+  /bookings/{bookingId}/date-change:
+    post:
+      tags:
+      - Postventa (Maletas, Fechas y Cancelaciones)
+      summary: Confirmar cambio de fecha
+      security:
+      - OAuth2Security:
+        - flights:book
+      parameters:
+      - name: bookingId
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      - name: Idempotency-Key
+        in: header
+        required: true
+        schema:
+          type: string
+          format: uuid
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/DateChangeRequest'
+      responses:
+        '200':
+          description: Cambio confirmado
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BookingDetail'
+        '202':
+          description: Cambio en proceso (CHANGE_PENDING)
+        '409':
+          $ref: '#/components/responses/ProblemDetails409'
+        '410':
+          $ref: '#/components/responses/ProblemDetails410'
+  /bookings/{bookingId}/cancellation-quote:
+    get:
+      tags:
+      - Postventa (Maletas, Fechas y Cancelaciones)
+      summary: Cotizar reembolso por cancelación
+      security:
+      - OAuth2Security:
+        - flights:read
+      parameters:
+      - name: bookingId
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      responses:
+        '200':
+          description: Cotización de cancelación
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CancellationQuoteResponse'
+  /bookings/{bookingId}/cancel:
+    post:
+      tags:
+      - Postventa (Maletas, Fechas y Cancelaciones)
+      summary: Cancelar reserva
+      security:
+      - OAuth2Security:
+        - flights:cancel
+      parameters:
+      - name: bookingId
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      - name: Idempotency-Key
+        in: header
+        required: true
+        schema:
+          type: string
+          format: uuid
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CancelBookingRequest'
+      responses:
+        '200':
+          description: Cancelación exitosa
+        '202':
+          description: Cancelación en proceso (CANCELLATION_PENDING)
+        '409':
+          $ref: '#/components/responses/ProblemDetails409'
+  /webhooks:
+    get:
+      tags:
+      - Webhooks
+      summary: Listar suscripciones
+      security:
+      - OAuth2Security:
+        - flights:webhooks
+      responses:
+        '200':
+          description: Suscripciones activas
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/WebhookSubscription'
+    post:
+      tags:
+      - Webhooks
+      summary: Registrar webhook
+      security:
+      - OAuth2Security:
+        - flights:webhooks
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/WebhookSubscription'
+      callbacks:
+        flightEvent:
+          '{$request.body#/url}':
+            post:
+              requestBody:
+                content:
+                  application/json:
+                    schema:
+                      $ref: '#/components/schemas/WebhookPayload'
+              responses:
+                '200':
+                  description: Recibido
+      responses:
+        '201':
+          description: Webhook registrado
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WebhookSubscription'
+  /webhooks/{id}:
+    delete:
+      tags:
+      - Webhooks
+      summary: Eliminar suscripción
+      security:
+      - OAuth2Security:
+        - flights:webhooks
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      responses:
+        '204':
+          description: Eliminado
+  /bookings/{bookingId}/tickets:
+    get:
+      tags:
+      - Reservas y Emisión
+      summary: Consultar tickets de una reserva
+      security:
+      - OAuth2Security:
+        - flights:read
+      parameters:
+      - name: bookingId
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      responses:
+        '200':
+          description: Tickets asociados a la reserva
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TicketListResponse'
+        '404':
+          $ref: '#/components/responses/ProblemDetails404'
+  /bookings/{bookingId}/tickets/{ticketId}:
+    get:
+      tags:
+      - Reservas y Emisión
+      summary: Consultar un ticket
+      security:
+      - OAuth2Security:
+        - flights:read
+      parameters:
+      - name: bookingId
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      - name: ticketId
+        in: path
+        required: true
+        schema:
+          type: string
+      responses:
+        '200':
+          description: Detalle del ticket
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Ticket'
+        '404':
+          $ref: '#/components/responses/ProblemDetails404'
+  /bookings/{bookingId}/check-in:
+    post:
+      tags:
+      - Check-in y Boarding Pass
+      summary: Realizar check-in de la reserva
+      security:
+      - OAuth2Security:
+        - flights:book
+      parameters:
+      - name: bookingId
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      responses:
+        '200':
+          description: Check-in realizado
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CheckInResponse'
+        '409':
+          $ref: '#/components/responses/ProblemDetails409'
+        '422':
+          $ref: '#/components/responses/ProblemDetails422'
+  /bookings/{bookingId}/boarding-passes:
+    get:
+      tags:
+      - Check-in y Boarding Pass
+      summary: Consultar pases de abordar
+      security:
+      - OAuth2Security:
+        - flights:read
+      parameters:
+      - name: bookingId
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      responses:
+        '200':
+          description: Pases de abordar disponibles
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BoardingPassListResponse'
+        '404':
+          $ref: '#/components/responses/ProblemDetails404'
+  /flights/{flightNumber}/status:
+    get:
+      tags:
+      - Estado de Vuelos
+      summary: Consultar estado de un vuelo
+      security: []
+      parameters:
+      - name: flightNumber
+        in: path
+        required: true
+        schema:
+          type: string
+      - name: date
+        in: query
+        required: true
+        schema:
+          type: string
+          format: date
+      responses:
+        '200':
+          description: Estado operativo del vuelo
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FlightStatus'
+        '404':
+          $ref: '#/components/responses/ProblemDetails404'
+components:
+  securitySchemes:
+    OAuth2Security:
+      type: oauth2
+      flows:
+        authorizationCode:
+          authorizationUrl: https://auth.booking-hub.com/oauth2/authorize
+          tokenUrl: https://auth.booking-hub.com/oauth2/token
+          scopes:
+            flights:read: Leer reservas
+            flights:hold: Bloquear inventario
+            flights:book: Comprar y alterar reserva
+            flights:cancel: Cancelar reservas
+            flights:webhooks: Gestionar webhooks
+        clientCredentials:
+          tokenUrl: https://auth.booking-hub.com/oauth2/token
+          scopes:
+            flights:read: (B2B) Leer
+            flights:hold: (B2B) Bloquear
+            flights:book: (B2B) Comprar
+            flights:cancel: (B2B) Cancelar
+            flights:webhooks: (B2B) Webhooks
+  responses:
+    ProblemDetails400:
+      description: Petición inválida
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/ProblemDetails'
+    ProblemDetails403:
+      description: Prohibido
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/ProblemDetails'
+    ProblemDetails404:
+      description: No encontrado
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/ProblemDetails'
+    ProblemDetails409:
+      description: Conflicto
+      headers:
+        Retry-After:
+          schema:
+            type: integer
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/ProblemDetails'
+    ProblemDetails410:
+      description: Recurso expirado (Hold o Cotización)
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/ProblemDetails'
+    ProblemDetails422:
+      description: Entidad no procesable (Ej. Infante con asiento)
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/ProblemDetails'
+    ProblemDetails429:
+      description: Demasiadas peticiones
+      headers:
+        Retry-After:
+          schema:
+            type: integer
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/ProblemDetails'
+  schemas:
+    ProblemDetails:
+      type: object
+      additionalProperties: false
+      required:
+      - type
+      - title
+      - status
+      - code
+      properties:
+        type:
+          type: string
+        title:
+          type: string
+        status:
+          type: integer
+        detail:
+          type: string
+        code:
+          type: string
+          enum:
+          - VALIDATION_FAILED
+          - SEAT_TAKEN
+          - AMOUNT_MISMATCH
+          - BOOKING_NOT_CONFIRMED
+          - BAGGAGE_LIMIT_EXCEEDED
+          - CUTOFF_PASSED
+          - FARE_NOT_CHANGEABLE
+          - FLIGHT_ALREADY_DEPARTED
+          - CHANGE_OFFER_EXPIRED
+          - OFFER_NO_LONGER_AVAILABLE
+          - QUOTE_EXPIRED
+          - ALREADY_CANCELLED
+          - RATE_LIMIT_EXCEEDED
+          - INFANT_SEAT_NOT_ALLOWED
+          - PAYMENT_REFERENCE_INVALID
+          - PAYMENT_NOT_AUTHORIZED
+          - PNR_CREATION_FAILED
+          - TICKET_ISSUANCE_FAILED
+          - TICKET_ALREADY_ISSUED
+          - CHECK_IN_NOT_AVAILABLE
+          - CHECK_IN_FAILED
+          - BOARDING_PASS_NOT_AVAILABLE
+          - SEAT_CABIN_MISMATCH
+          - FLIGHT_STATUS_NOT_AVAILABLE
+        invalidParams:
+          type: array
+          items:
+            type: object
+            properties:
+              name:
+                type: string
+              reason:
+                type: string
+    SearchRequest:
+      type: object
+      additionalProperties: false
+      required:
+      - itineraries
+      - passengers
+      properties:
+        itineraries:
+          type: array
+          minItems: 1
+          maxItems: 6
+          items:
+            type: object
+            required:
+            - origin
+            - destination
+            - departureDate
+            properties:
+              origin:
+                type: string
+                pattern: ^[A-Z]{3}$
+              destination:
+                type: string
+                pattern: ^[A-Z]{3}$
+              departureDate:
+                type: string
+                format: date
+        passengers:
+          $ref: '#/components/schemas/PassengerBreakdown'
+    PassengerBreakdown:
+      type: object
+      properties:
+        adults:
+          type: integer
+          minimum: 1
+          default: 1
+        youths:
+          type: integer
+          minimum: 0
+          default: 0
+        children:
+          type: integer
+          minimum: 0
+          default: 0
+        infants:
+          type: integer
+          minimum: 0
+          default: 0
+    SearchResponse:
+      type: object
+      required:
+      - totalOffers
+      - offers
+      properties:
+        totalOffers:
+          type: integer
+        offers:
+          type: array
+          items:
+            $ref: '#/components/schemas/FlightOffer'
+    FlightOffer:
+      type: object
+      required:
+      - offerId
+      - airline
+      - itineraries
+      - grandTotal
+      properties:
+        offerId:
+          type: string
+        airline:
+          type: object
+          properties:
+            code:
+              type: string
+            name:
+              type: string
+        itineraries:
+          type: array
+          items:
+            $ref: '#/components/schemas/ItineraryOption'
+        grandTotal:
+          $ref: '#/components/schemas/MoneyAmount'
+    ItineraryOption:
+      type: object
+      required:
+      - itineraryId
+      - totalDurationMinutes
+      - stopsCount
+      - segments
+      - pricingOptions
+      properties:
+        itineraryId:
+          type: string
+        totalDurationMinutes:
+          type: integer
+        stopsCount:
+          type: integer
+        segments:
+          type: array
+          items:
+            $ref: '#/components/schemas/FlightSegment'
+        pricingOptions:
+          type: array
+          items:
+            $ref: '#/components/schemas/CabinPricing'
+    FlightSegment:
+      type: object
+      required:
+      - segmentId
+      - flightNumber
+      - departure
+      - arrival
+      - marketingCarrier
+      - operatingCarrier
+      properties:
+        segmentId:
+          type: string
+        flightNumber:
+          type: string
+        departure:
+          $ref: '#/components/schemas/FlightEndpoint'
+        arrival:
+          $ref: '#/components/schemas/FlightEndpoint'
+        layoverMinutes:
+          type: integer
+        marketingCarrier:
+          type: string
+          description: Código IATA de la aerolínea comercial.
+        operatingCarrier:
+          type: string
+          description: Código IATA de la aerolínea que opera el vuelo.
+        aircraft:
+          type: string
+          nullable: true
+          description: Tipo de aeronave, cuando esté disponible.
+        durationMinutes:
+          type: integer
+          minimum: 0
+          nullable: true
+        status:
+          type: string
+          nullable: true
+          enum:
+          - SCHEDULED
+          - BOARDING
+          - DEPARTED
+          - DELAYED
+          - ARRIVED
+          - CANCELLED
+          - DIVERTED
+    FlightEndpoint:
+      type: object
+      required:
+      - iataCode
+      - at
+      properties:
+        iataCode:
+          type: string
+          pattern: ^[A-Z]{3}$
+        at:
+          type: string
+          format: date-time
+        terminal:
+          type: string
+          nullable: true
+    CabinPricing:
+      type: object
+      required:
+      - cabinClass
+      - fareBrand
+      - availableSeats
+      - fareRules
+      - baggageAllowance
+      - pricePerPassengerType
+      properties:
+        cabinClass:
+          type: string
+          enum:
+          - ECONOMY
+          - PREMIUM_ECONOMY
+          - BUSINESS
+          - FIRST
+        fareBrand:
+          type: string
+        availableSeats:
+          type: integer
+        fareRules:
+          type: object
+          required:
+          - isRefundable
+          - isChangeable
+          properties:
+            isRefundable:
+              type: boolean
+            isChangeable:
+              type: boolean
+        baggageAllowance:
+          type: object
+          properties:
+            personalItemIncluded:
+              type: boolean
+            carryOnIncluded:
+              type: integer
+            checkedBaggageIncluded:
+              type: integer
+        extraCheckedBaggagePrice:
+          $ref: '#/components/schemas/MoneyAmount'
+        pricePerPassengerType:
+          type: array
+          items:
+            type: object
+            properties:
+              passengerType:
+                type: string
+              price:
+                $ref: '#/components/schemas/MoneyAmount'
+    MoneyAmount:
+      type: object
+      required:
+      - currency
+      - total
+      properties:
+        currency:
+          type: string
+          pattern: ^[A-Z]{3}$
+        baseFare:
+          type: string
+        taxes:
+          type: string
+        total:
+          type: string
+    SeatMapResponse:
+      type: object
+      properties:
+        segmentId:
+          type: string
+        cabins:
+          type: array
+          items:
+            type: object
+            properties:
+              cabinClass:
+                type: string
+              rows:
+                type: array
+                items:
+                  type: object
+                  properties:
+                    rowNumber:
+                      type: integer
+                    seats:
+                      type: array
+                      items:
+                        type: object
+                        properties:
+                          seatNumber:
+                            type: string
+                          isAvailable:
+                            type: boolean
+                          characteristics:
+                            type: array
+                            items:
+                              type: string
+                              enum:
+                              - WINDOW
+                              - AISLE
+                              - EXTRA_LEGROOM
+                              - EMERGENCY_EXIT
+      description: Mapa básico de asientos sin precios. Los asientos seleccionables deben corresponder a la cabina adquirida
+        por el pasajero.
+    HoldRequest:
+      type: object
+      required:
+      - offerId
+      - itinerarySelections
+      - passengersBreakdown
+      properties:
+        offerId:
+          type: string
+        itinerarySelections:
+          type: array
+          items:
+            type: object
+            required:
+            - itineraryId
+            - cabinClass
+            - fareBrand
+            properties:
+              itineraryId:
+                type: string
+              cabinClass:
+                type: string
+              fareBrand:
+                type: string
+        passengersBreakdown:
+          $ref: '#/components/schemas/PassengerBreakdown'
+    HoldResponse:
+      type: object
+      required:
+      - holdId
+      - status
+      - expiresAt
+      - ttlMinutes
+      - lockedPrice
+      properties:
+        holdId:
+          type: string
+          format: uuid
+        status:
+          type: string
+          enum:
+          - HELD
+        expiresAt:
+          type: string
+          format: date-time
+        ttlMinutes:
+          type: integer
+        lockedPrice:
+          $ref: '#/components/schemas/MoneyAmount'
+    HoldStatusResponse:
+      type: object
+      required:
+      - status
+      - remainingSeconds
+      - lockedPrice
+      properties:
+        status:
+          type: string
+          enum:
+          - HELD
+          - RELEASED
+          - EXPIRED
+          - CONSUMED
+        expiresAt:
+          type: string
+          format: date-time
+        remainingSeconds:
+          type: integer
+        lockedPrice:
+          $ref: '#/components/schemas/MoneyAmount'
+    BookingRequest:
+      type: object
+      additionalProperties: false
+      required:
+      - holdId
+      - passengers
+      - payment
+      properties:
+        holdId:
+          type: string
+          format: uuid
+        passengers:
+          type: array
+          items:
+            $ref: '#/components/schemas/PassengerItem'
+        payment:
+          $ref: '#/components/schemas/PaymentReference'
+    PassengerItem:
+      type: object
+      required:
+      - passengerId
+      - passengerType
+      - firstName
+      - lastName
+      - documentType
+      - documentNumber
+      - nationality
+      - birthDate
+      - gender
+      - contact
+      properties:
+        passengerId:
+          type: string
+        passengerType:
+          type: string
+          enum:
+          - ADULT
+          - YOUTH
+          - CHILD
+          - INFANT
+        associatedAdultId:
+          type: string
+        firstName:
+          type: string
+        lastName:
+          type: string
+        documentType:
+          type: string
+          enum:
+          - PASSPORT
+          - NATIONAL_ID
+        documentNumber:
+          type: string
+        nationality:
+          type: string
+        documentExpiryDate:
+          type: string
+          format: date
+        birthDate:
+          type: string
+          format: date
+        gender:
+          type: string
+          enum:
+          - M
+          - F
+          - X
+        contact:
+          type: object
+          required:
+          - email
+          - phone
+          properties:
+            email:
+              type: string
+            phone:
+              type: string
+        assignedSeats:
+          type: array
+          items:
+            type: object
+            required:
+            - segmentId
+            - seatNumber
+            properties:
+              segmentId:
+                type: string
+              seatNumber:
+                type: string
+        extraBaggage:
+          type: array
+          items:
+            type: object
+            required:
+            - itineraryId
+            - quantity
+            properties:
+              itineraryId:
+                type: string
+              quantity:
+                type: integer
+    BookingListResponse:
+      type: object
+      properties:
+        nextCursor:
+          type: string
+        items:
+          type: array
+          items:
+            type: object
+            properties:
+              bookingId:
+                type: string
+              pnr:
+                type: string
+              status:
+                type: string
+              origin:
+                type: string
+              destination:
+                type: string
+              departureDate:
+                type: string
+                format: date
+              grandTotal:
+                $ref: '#/components/schemas/MoneyAmount'
+    BookingDetail:
+      type: object
+      required:
+      - bookingId
+      - pnr
+      - status
+      - grandTotal
+      - createdAt
+      properties:
+        bookingId:
+          type: string
+          format: uuid
+        pnr:
+          type: string
+        status:
+          type: string
+          enum:
+          - PENDING
+          - PENDING_PAYMENT
+          - TICKET_ISSUING
+          - CONFIRMED
+          - FAILED
+          - CHANGE_PENDING
+          - CANCELLATION_PENDING
+          - CANCELLED
+        grandTotal:
+          $ref: '#/components/schemas/MoneyAmount'
+        createdAt:
+          type: string
+          format: date-time
+        updatedAt:
+          type: string
+          format: date-time
+        itineraries:
+          type: array
+          items:
+            $ref: '#/components/schemas/ItineraryOption'
+        passengers:
+          type: array
+          items:
+            $ref: '#/components/schemas/PassengerItem'
+        tickets:
+          type: array
+          items:
+            $ref: '#/components/schemas/Ticket'
+        changes:
+          type: array
+          items:
+            type: object
+            properties:
+              changedAt:
+                type: string
+                format: date-time
+              description:
+                type: string
+    BaggageOptionsResponse:
+      type: array
+      items:
+        type: object
+        properties:
+          passengerId:
+            type: string
+          itineraryId:
+            type: string
+          price:
+            $ref: '#/components/schemas/MoneyAmount'
+          maxAllowed:
+            type: integer
+          alreadyPurchased:
+            type: integer
+    AddBaggageRequest:
+      type: object
+      required:
+      - passengerId
+      - itineraryId
+      - quantity
+      - payment
+      properties:
+        passengerId:
+          type: string
+        itineraryId:
+          type: string
+        quantity:
+          type: integer
+          minimum: 1
+        payment:
+          $ref: '#/components/schemas/PaymentReference'
+    BaggageAddedResponse:
+      type: object
+      properties:
+        passengerId:
+          type: string
+        itineraryId:
+          type: string
+        totalBaggage:
+          type: integer
+    DateChangeSearchRequest:
+      type: object
+      required:
+      - changes
+      properties:
+        changes:
+          type: array
+          items:
+            type: object
+            required:
+            - itineraryId
+            - newDepartureDate
+            properties:
+              itineraryId:
+                type: string
+              newDepartureDate:
+                type: string
+                format: date
+    DateChangeSearchResponse:
+      type: array
+      items:
+        type: object
+        properties:
+          changeOfferId:
+            type: string
+          expiresAt:
+            type: string
+            format: date-time
+          segments:
+            type: array
+            items:
+              $ref: '#/components/schemas/FlightSegment'
+          priceDifference:
+            type: object
+            properties:
+              fareDifference:
+                type: string
+              taxDifference:
+                type: string
+              changeFee:
+                type: string
+              totalToPay:
+                type: string
+    DateChangeRequest:
+      type: object
+      required:
+      - changeOfferId
+      properties:
+        changeOfferId:
+          type: string
+        payment:
+          $ref: '#/components/schemas/PaymentReference'
+        assignedSeats:
+          type: array
+          items:
+            type: object
+            properties:
+              segmentId:
+                type: string
+              seatNumber:
+                type: string
+    CancellationQuoteResponse:
+      type: object
+      required:
+      - quoteId
+      - isRefundable
+      - refundAmount
+      - penaltyAmount
+      - currency
+      - expiresAt
+      properties:
+        quoteId:
+          type: string
+        isRefundable:
+          type: boolean
+        refundAmount:
+          type: string
+        penaltyAmount:
+          type: string
+        currency:
+          type: string
+        expiresAt:
+          type: string
+          format: date-time
+    CancelBookingRequest:
+      type: object
+      required:
+      - quoteId
+      properties:
+        quoteId:
+          type: string
+        reason:
+          type: string
+    WebhookSubscription:
+      type: object
+      required:
+      - url
+      - events
+      - secret
+      properties:
+        id:
+          type: string
+          format: uuid
+          readOnly: true
+        url:
+          type: string
+          format: uri
+        events:
+          type: array
+          items:
+            type: string
+            enum:
+            - booking.confirmed
+            - booking.failed
+            - booking.changed
+            - booking.cancelled
+            - booking.baggage_added
+            - hold.expired
+            - flight.schedule_changed
+            - flight.cancelled
+            - booking.ticket_issuing
+            - booking.ticket_issued
+            - booking.ticket_failed
+            - booking.checked_in
+        secret:
+          type: string
+    WebhookPayload:
+      type: object
+      properties:
+        eventId:
+          type: string
+        eventType:
+          type: string
+        occurredAt:
+          type: string
+          format: date-time
+        apiVersion:
+          type: string
+        data:
+          type: object
+          properties:
+            bookingId:
+              type: string
+            pnr:
+              type: string
+            status:
+              type: string
+            refundAmount:
+              type: string
+    PaymentReference:
+      type: object
+      description: Referencia a un pago gestionado por la Payment API. Esta API no procesa tarjetas, 3DS, autorización ni
+        captura.
+      additionalProperties: false
+      required:
+      - paymentReference
+      properties:
+        paymentReference:
+          type: string
+          description: Identificador del pago generado por la Payment API.
+    TicketStatus:
+      type: string
+      enum:
+      - PENDING
+      - ISSUING
+      - ISSUED
+      - FAILED
+      - VOIDED
+      - REFUNDED
+    TicketSegmentStatus:
+      type: string
+      enum:
+      - PENDING
+      - ISSUED
+      - FAILED
+    TicketSegment:
+      type: object
+      required:
+      - segmentId
+      - status
+      properties:
+        segmentId:
+          type: string
+        status:
+          $ref: '#/components/schemas/TicketSegmentStatus'
+        couponNumber:
+          type: string
+          nullable: true
+    Ticket:
+      type: object
+      required:
+      - ticketId
+      - bookingId
+      - passengerId
+      - status
+      properties:
+        ticketId:
+          type: string
+          readOnly: true
+        bookingId:
+          type: string
+          format: uuid
+          readOnly: true
+        passengerId:
+          type: string
+        eTicketNumber:
+          type: string
+          nullable: true
+          readOnly: true
+        status:
+          $ref: '#/components/schemas/TicketStatus'
+        issuedAt:
+          type: string
+          format: date-time
+          nullable: true
+          readOnly: true
+        segments:
+          type: array
+          items:
+            $ref: '#/components/schemas/TicketSegment'
+        failureReason:
+          type: string
+          nullable: true
+          readOnly: true
+    TicketListResponse:
+      type: object
+      required:
+      - bookingId
+      - tickets
+      properties:
+        bookingId:
+          type: string
+          format: uuid
+        tickets:
+          type: array
+          items:
+            $ref: '#/components/schemas/Ticket'
+    CheckInStatus:
+      type: string
+      enum:
+      - NOT_ELIGIBLE
+      - AVAILABLE
+      - IN_PROGRESS
+      - COMPLETED
+      - FAILED
+    CheckInResponse:
+      type: object
+      required:
+      - bookingId
+      - status
+      - checkedInPassengers
+      properties:
+        bookingId:
+          type: string
+          format: uuid
+        status:
+          $ref: '#/components/schemas/CheckInStatus'
+        checkedInPassengers:
+          type: array
+          items:
+            type: object
+            required:
+            - passengerId
+            - status
+            properties:
+              passengerId:
+                type: string
+              status:
+                type: string
+                enum:
+                - CHECKED_IN
+                - NOT_CHECKED_IN
+                - FAILED
+              segments:
+                type: array
+                items:
+                  type: object
+                  required:
+                  - segmentId
+                  - status
+                  properties:
+                    segmentId:
+                      type: string
+                    seat:
+                      type: string
+                      nullable: true
+                    status:
+                      type: string
+                      enum:
+                      - CHECKED_IN
+                      - NOT_CHECKED_IN
+                      - FAILED
+    BoardingPass:
+      type: object
+      required:
+      - passengerId
+      - segmentId
+      - seat
+      - barcode
+      - barcodeType
+      properties:
+        passengerId:
+          type: string
+        segmentId:
+          type: string
+        seat:
+          type: string
+        boardingGroup:
+          type: string
+          nullable: true
+        boardingPosition:
+          type: string
+          nullable: true
+        barcode:
+          type: string
+        barcodeType:
+          type: string
+          enum:
+          - AZTEC
+          - PDF417
+          - QR
+    BoardingPassListResponse:
+      type: object
+      required:
+      - bookingId
+      - boardingPasses
+      properties:
+        bookingId:
+          type: string
+          format: uuid
+        boardingPasses:
+          type: array
+          items:
+            $ref: '#/components/schemas/BoardingPass'
+    FlightStatus:
+      type: object
+      required:
+      - flightNumber
+      - date
+      - marketingCarrier
+      - operatingCarrier
+      - departure
+      - arrival
+      - status
+      properties:
+        flightNumber:
+          type: string
+        date:
+          type: string
+          format: date
+        marketingCarrier:
+          type: string
+        operatingCarrier:
+          type: string
+        departure:
+          type: object
+          required:
+          - iataCode
+          - scheduledAt
+          properties:
+            iataCode:
+              type: string
+              pattern: ^[A-Z]{3}$
+            terminal:
+              type: string
+              nullable: true
+            scheduledAt:
+              type: string
+              format: date-time
+            estimatedAt:
+              type: string
+              format: date-time
+              nullable: true
+            actualAt:
+              type: string
+              format: date-time
+              nullable: true
+        arrival:
+          type: object
+          required:
+          - iataCode
+          - scheduledAt
+          properties:
+            iataCode:
+              type: string
+              pattern: ^[A-Z]{3}$
+            terminal:
+              type: string
+              nullable: true
+            scheduledAt:
+              type: string
+              format: date-time
+            estimatedAt:
+              type: string
+              format: date-time
+              nullable: true
+            actualAt:
+              type: string
+              format: date-time
+              nullable: true
+        aircraft:
+          type: string
+          nullable: true
+        status:
+          type: string
+          enum:
+          - SCHEDULED
+          - BOARDING
+          - DEPARTED
+          - DELAYED
+          - ARRIVED
+          - CANCELLED
+          - DIVERTED

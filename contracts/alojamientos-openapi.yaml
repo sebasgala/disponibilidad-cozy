@@ -1,0 +1,1205 @@
+# Define la versión del estándar OpenAPI que estamos utilizando.
+openapi: 3.0.3
+
+# Sección de metadatos de la API
+info:
+  # El nombre de la API que aparecerá en la documentación
+  title: GDS Alojamientos Core API
+  # Una descripción detallada de lo que hace este microservicio
+  description: Microservicio centralizado para búsqueda, disponibilidad, reservas (órdenes), postventa de alojamientos y mensajería con la propiedad.
+    El dueño de la reserva (ownerId) se infiere del sub del token JWT. La lógica de pagos pertenece a otros dominios/APIs.
+  # La versión actual del contrato/API
+  version: 1.0.0
+  # Información de contacto de los responsables de la API
+  contact:
+    name: Joselyn Cadena
+    email: jlcadenac@puce.edu.ec
+
+# Lista de servidores donde la API está alojada
+servers:
+# URL del entorno de Producción
+- url: https://api.booking-hub.com/alojamientos/v1
+  description: Producción
+# URL del entorno de Pruebas o Sandbox
+- url: https://sandbox.api.booking-hub.com/alojamientos/v1
+  description: Sandbox
+
+# Configuración global de seguridad. Todos los endpoints exigirán esto por defecto.
+security:
+# Especifica que usaremos el esquema de seguridad OAuth2 definido más abajo
+- OAuth2Security: []
+
+# Categorías visuales para organizar la documentación (Swagger)
+tags:
+- name: Búsqueda y Catálogo
+- name: Disponibilidad y Precios
+- name: Gestión de Órdenes (Reservas)
+- name: Componentes Comunes
+- name: Webhooks
+
+# Aquí definimos todas las rutas (URLs) de nuestra API
+paths:
+  
+  # Endpoint para buscar alojamientos
+  /search:
+    # Método HTTP POST
+    post:
+      # Asignamos este endpoint a la categoría "Búsqueda y Catálogo"
+      tags:
+      - Búsqueda y Catálogo
+      # Un resumen corto de lo que hace el endpoint
+      summary: Búsqueda de alojamientos
+      # Sobreescribe la seguridad global: este endpoint es público (no requiere token)
+      security: []
+      # Parámetros que la petición recibe en la URL o en los Headers
+      parameters:
+      # Definimos un header obligatorio llamado X-Device-Fingerprint
+      - name: X-Device-Fingerprint
+        in: header
+        required: true
+        schema:
+          type: string
+      # El cuerpo de la petición (JSON que el cliente debe enviar)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              # Hace referencia al esquema 'SearchAccommodationRequest' definido en components
+              $ref: '#/components/schemas/SearchAccommodationRequest'
+      # Las posibles respuestas que este endpoint puede devolver
+      responses:
+        # Si todo sale bien (Código 200 OK)
+        '200':
+          description: Alojamientos encontrados
+          headers:
+            Cache-Control:
+              schema:
+                type: string
+                example: 'public, max-age=300'
+            X-API-Deprecation-Date:
+              schema:
+                type: string
+                format: date
+                description: Fecha prevista de baja de esta versión de la API.
+          content:
+            application/json:
+              schema:
+                # Hace referencia al esquema de respuesta
+                $ref: '#/components/schemas/SearchAccommodationResponse'
+        # Si el cliente envía datos inválidos (Código 400)
+        '400':
+          $ref: '#/components/responses/ProblemDetails400'
+        # Si el cliente hace demasiadas peticiones (Código 429)
+        '429':
+          $ref: '#/components/responses/ProblemDetails429'
+  
+  # Endpoint para ver disponibilidad y precios
+  /availability:
+    post:
+      tags:
+      - Disponibilidad y Precios
+      summary: Consultar disponibilidad y precio de un alojamiento
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AvailabilityRequest'
+      responses:
+        '200':
+          description: Disponibilidad y detalles del precio
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AvailabilityResponse'
+        '400':
+          $ref: '#/components/responses/ProblemDetails400'
+  
+  # Endpoint para ver disponibilidad de múltiples alojamientos a la vez
+  /bulk-availability:
+    post:
+      tags:
+      - Disponibilidad y Precios
+      summary: Consultar disponibilidad múltiple de alojamientos
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/BulkAvailabilityRequest'
+      responses:
+        '200':
+          description: Disponibilidad para múltiples alojamientos
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BulkAvailabilityResponse'
+  
+  # Endpoint para obtener información detallada de hoteles (fotos, descripción)
+  /details:
+    post:
+      tags:
+      - Búsqueda y Catálogo
+      summary: Obtener detalles extendidos de los alojamientos
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AccommodationDetailsRequest'
+      responses:
+        '200':
+          description: Detalles de los alojamientos solicitados
+          headers:
+            Cache-Control:
+              schema:
+                type: string
+                example: 'public, max-age=300'
+            X-API-Deprecation-Date:
+              schema:
+                type: string
+                format: date
+                description: Fecha prevista de baja de esta versión de la API.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AccommodationDetailsResponse'
+  
+  # Endpoint para ver qué hoteles han modificado su información recientemente
+  /details/changes:
+    post:
+      tags:
+      - Búsqueda y Catálogo
+      summary: Obtener alojamientos que han cambiado desde una fecha
+      # Este endpoint SÍ requiere seguridad. Pide el token con permiso 'alojamientos:read'
+      security:
+      - OAuth2Security:
+        - alojamientos:read
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/DetailsChangesRequest'
+      responses:
+        '200':
+          description: Lista de alojamientos modificados
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DetailsChangesResponse'
+  
+  # Endpoint para ver el catálogo de cadenas hoteleras (Ej. Hilton, Marriott)
+  /chains:
+    post:
+      tags:
+      - Búsqueda y Catálogo
+      summary: Listar cadenas hoteleras y sus marcas
+      security: []
+      responses:
+        '200':
+          description: Lista de cadenas hoteleras
+          headers:
+            Cache-Control:
+              schema:
+                type: string
+                example: 'public, max-age=3600'
+            X-API-Deprecation-Date:
+              schema:
+                type: string
+                format: date
+                description: Fecha prevista de baja de esta versión de la API.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ChainsResponse'
+  
+  # Endpoint para listas estáticas o constantes (ej. tipos de cama, facilidades)
+  /constants:
+    post:
+      tags:
+      - Componentes Comunes
+      summary: Consultar constantes del sistema (facilidades, tipos de cuartos, etc.)
+      security: []
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ConstantsRequest'
+      responses:
+        '200':
+          description: Constantes del sistema
+          headers:
+            Cache-Control:
+              schema:
+                type: string
+                example: 'public, max-age=86400'
+            X-API-Deprecation-Date:
+              schema:
+                type: string
+                format: date
+                description: Fecha prevista de baja de esta versión de la API.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ConstantsResponse'
+  
+  # Endpoint para leer comentarios y calificaciones de otros usuarios
+  /reviews:
+    post:
+      tags:
+      - Búsqueda y Catálogo
+      summary: Obtener reseñas de alojamientos
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ReviewsRequest'
+      responses:
+        '200':
+          description: Reseñas de los alojamientos
+          headers:
+            Cache-Control:
+              schema:
+                type: string
+                example: 'public, max-age=600'
+            X-API-Deprecation-Date:
+              schema:
+                type: string
+                format: date
+                description: Fecha prevista de baja de esta versión de la API.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ReviewsResponse'
+  
+  # Endpoint para ver solo el desglose de puntajes de un hotel (Ej. Limpieza: 9.5)
+  /reviews/scores:
+    post:
+      tags:
+      - Búsqueda y Catálogo
+      summary: Obtener puntuaciones de reseñas
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ReviewsScoresRequest'
+      responses:
+        '200':
+          description: Puntuaciones desglosadas
+          headers:
+            Cache-Control:
+              schema:
+                type: string
+                example: 'public, max-age=600'
+            X-API-Deprecation-Date:
+              schema:
+                type: string
+                format: date
+                description: Fecha prevista de baja de esta versión de la API.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ReviewsScoresResponse'
+  
+  # Endpoint para previsualizar el precio final de la orden antes de pagar
+  /orders/preview:
+    post:
+      tags:
+      - Gestión de Órdenes (Reservas)
+      summary: Previsualizar orden antes de confirmar
+      # Requiere permiso de lectura
+      security:
+      - OAuth2Security:
+        - alojamientos:read
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/OrderPreviewRequest'
+      responses:
+        '200':
+          description: Detalles de la orden previsualizada y precios finales
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OrderPreviewResponse'
+  
+  # Endpoint para crear formalmente la reserva (Orden)
+  /orders/create:
+    post:
+      tags:
+      - Gestión de Órdenes (Reservas)
+      summary: Crear reserva de alojamiento
+      # Requiere permiso de escritura/reserva
+      security:
+      - OAuth2Security:
+        - alojamientos:book
+      parameters:
+      # Header usado para evitar cobros dobles si hay un error de red
+      - name: Idempotency-Key
+        in: header
+        required: true
+        schema:
+          type: string
+          format: uuid
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/OrderCreateRequest'
+      responses:
+        # Código 201 significa 'Creado con éxito'
+        '201':
+          description: Orden creada exitosamente
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OrderDetail'
+        '400':
+          $ref: '#/components/responses/ProblemDetails400'
+        # Código 409: Conflicto (Ej. la habitación ya se la llevó alguien más)
+        '409':
+          $ref: '#/components/responses/ProblemDetails409'
+  
+  # Endpoint para ver el detalle de una orden existente usando su ID en la URL
+  /orders/{orderId}:
+    # Método HTTP GET (solo leer datos, no modificar)
+    get:
+      tags:
+      - Gestión de Órdenes (Reservas)
+      summary: Obtener detalles de la orden
+      security:
+      - OAuth2Security:
+        - alojamientos:read
+      parameters:
+      # Parámetro que va en la ruta (URL), por ejemplo /orders/123e4567-e89b...
+      - name: orderId
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      responses:
+        '200':
+          description: Detalles completos de la orden
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OrderDetail'
+        # Código 404: No encontrado (la orden no existe)
+        '404':
+          $ref: '#/components/responses/ProblemDetails404'
+  
+  # Endpoint para modificar fechas o personas en una reserva
+  /orders/{orderId}/modify:
+    post:
+      tags:
+      - Gestión de Órdenes (Reservas)
+      summary: Modificar una orden existente
+      security:
+      - OAuth2Security:
+        - alojamientos:book
+      parameters:
+      - name: orderId
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      - name: Idempotency-Key
+        in: header
+        required: true
+        schema:
+          type: string
+          format: uuid
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/OrderModifyRequest'
+      responses:
+        '200':
+          description: Orden modificada
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OrderDetail'
+        '409':
+          $ref: '#/components/responses/ProblemDetails409'
+  
+  # Endpoint para cancelar una reserva
+  /orders/{orderId}/cancel:
+    post:
+      tags:
+      - Gestión de Órdenes (Reservas)
+      summary: Cancelar una orden
+      # Requiere un permiso especial para cancelaciones
+      security:
+      - OAuth2Security:
+        - alojamientos:cancel
+      parameters:
+      - name: orderId
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      - name: Idempotency-Key
+        in: header
+        required: true
+        schema:
+          type: string
+          format: uuid
+      responses:
+        '200':
+          description: Cancelación procesada
+        '409':
+          $ref: '#/components/responses/ProblemDetails409'
+  
+  # Endpoint para listar webhooks (URLs a las que la API te enviará notificaciones automáticas)
+  /webhooks:
+    get:
+      tags:
+      - Webhooks
+      summary: Listar suscripciones
+      security:
+      - OAuth2Security:
+        - alojamientos:webhooks
+      responses:
+        '200':
+          description: Suscripciones activas
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/WebhookSubscription'
+    
+    # Endpoint para registrar una nueva URL que recibirá notificaciones
+    post:
+      tags:
+      - Webhooks
+      summary: Registrar webhook
+      security:
+      - OAuth2Security:
+        - alojamientos:webhooks
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/WebhookSubscription'
+      # 'callbacks' documenta cómo será la petición que la API le enviará a tu webhook
+      callbacks:
+        accommodationEvent:
+          '{$request.body#/url}':
+            post:
+              requestBody:
+                content:
+                  application/json:
+                    schema:
+                      $ref: '#/components/schemas/WebhookPayload'
+              responses:
+                '200':
+                  description: Recibido
+      responses:
+        '201':
+          description: Webhook registrado
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WebhookSubscription'
+  
+  # Endpoint para eliminar una suscripción de webhook
+  /webhooks/{id}:
+    delete:
+      tags:
+      - Webhooks
+      summary: Eliminar suscripción
+      security:
+      - OAuth2Security:
+        - alojamientos:webhooks
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      responses:
+        '204':
+          description: Eliminado
+
+# Componentes reutilizables. Aquí definimos moldes para no repetir código.
+components:
+  
+  # Moldes de Seguridad
+  securitySchemes:
+    # Definimos cómo funciona el OAuth2
+    OAuth2Security:
+      # Tipo de seguridad
+      type: oauth2
+      # Flujos permitidos en OAuth2
+      flows:
+        # Flujo para usuarios que inician sesión (ej. con correo y contraseña)
+        authorizationCode:
+          authorizationUrl: https://auth.booking-hub.com/oauth2/authorize
+          tokenUrl: https://auth.booking-hub.com/oauth2/token
+          # Permisos disponibles (scopes)
+          scopes:
+            alojamientos:read: Leer información de alojamientos, disponibilidades y reservas
+            alojamientos:book: Crear y alterar reservas
+            alojamientos:cancel: Cancelar reservas
+            alojamientos:webhooks: Gestionar webhooks
+        # Flujo para sistemas automáticos o máquinas (backend a backend)
+        clientCredentials:
+          tokenUrl: https://auth.booking-hub.com/oauth2/token
+          scopes:
+            alojamientos:read: (B2B) Leer
+            alojamientos:book: (B2B) Comprar
+            alojamientos:cancel: (B2B) Cancelar
+            alojamientos:webhooks: (B2B) Webhooks
+  
+  # Moldes de Respuestas de Error. Todos usan el esquema 'ProblemDetails'
+  responses:
+    ProblemDetails400:
+      description: Petición inválida
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/ProblemDetails'
+    ProblemDetails403:
+      description: Prohibido
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/ProblemDetails'
+    ProblemDetails404:
+      description: No encontrado
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/ProblemDetails'
+    ProblemDetails409:
+      description: Conflicto (Ej. Alojamiento no disponible, cambio de precio)
+      headers:
+        Retry-After:
+          schema:
+            type: integer
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/ProblemDetails'
+    ProblemDetails429:
+      description: Demasiadas peticiones
+      headers:
+        Retry-After:
+          schema:
+            type: integer
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/ProblemDetails'
+  
+  # Moldes de Datos (Schemas). Definimos los JSON exactos que viajan en las peticiones.
+  schemas:
+    
+    # Esquema estándar para reportar errores detallados
+    ProblemDetails:
+      # Es un objeto JSON
+      type: object
+      # No permite campos extra que no estén definidos aquí
+      additionalProperties: false
+      # Estos campos son obligatorios
+      required:
+      - type
+      - title
+      - status
+      - code
+      properties:
+        type:
+          type: string
+        title:
+          type: string
+        status:
+          type: integer
+        detail:
+          type: string
+        code:
+          type: string
+          # Valores posibles para el código de error
+          enum:
+          - VALIDATION_FAILED
+          - ROOM_NO_LONGER_AVAILABLE
+          - PRICE_CHANGED
+          - BOOKING_NOT_CONFIRMED
+          - CANCELLATION_NOT_ALLOWED
+          - RATE_LIMIT_EXCEEDED
+          - PAYMENT_REFERENCE_INVALID
+          - PAYMENT_NOT_AUTHORIZED
+        # Lista de parámetros inválidos para explicar exactamente qué falló
+        invalidParams:
+          type: array
+          items:
+            type: object
+            properties:
+              name:
+                type: string
+              reason:
+                type: string
+    
+    # Esquema que representa a la persona que hace la reserva
+    Booker:
+      type: object
+      required:
+      - country
+      - platform
+      properties:
+        country:
+          type: string
+          # Regresión regular: obliga a que sean exactamente 2 letras minúsculas (Ej. 'us', 'mx')
+          pattern: ^[a-z]{2}$
+          description: Código ISO 3166-1 alpha-2 del país del comprador.
+        platform:
+          type: string
+          enum:
+          - android
+          - desktop
+          - ios
+          - mobile
+          - tablet
+        state:
+          type: string
+          pattern: ^[a-z]{2}$
+        travel_purpose:
+          type: string
+          enum:
+          - business
+          - leisure
+        user_groups:
+          type: array
+          items:
+            type: string
+            enum:
+            - authenticated
+    
+    # Esquema que representa a los huéspedes
+    AccommodationsGuests:
+      type: object
+      required:
+      - number_of_adults
+      - number_of_rooms
+      properties:
+        number_of_adults:
+          type: integer
+          # Mínimo 1 adulto
+          minimum: 1
+        number_of_rooms:
+          type: integer
+          minimum: 1
+        children:
+          type: array
+          items:
+            type: integer
+            description: Edades de los niños
+        allocation:
+          type: array
+          items:
+            type: object
+            properties:
+              adults:
+                type: integer
+              children:
+                type: array
+                items:
+                  type: integer
+    
+    # JSON que se envía al buscar alojamientos
+    SearchAccommodationRequest:
+      type: object
+      required:
+      - booker
+      - checkin
+      - checkout
+      - guests
+      properties:
+        # Inyecta el esquema de Booker aquí
+        booker:
+          $ref: '#/components/schemas/Booker'
+        checkin:
+          type: string
+          # Formato de fecha estándar (YYYY-MM-DD)
+          format: date
+        checkout:
+          type: string
+          format: date
+        city:
+          type: integer
+        country:
+          type: string
+          pattern: ^[a-z]{2}$
+        guests:
+          $ref: '#/components/schemas/AccommodationsGuests'
+        extras:
+          type: array
+          items:
+            type: string
+            enum:
+            - extra_charges
+            - products
+        currency:
+          type: string
+          # Exactamente 3 letras mayúsculas para la moneda (Ej. USD, EUR)
+          pattern: ^[A-Z]{3}$
+        rows:
+          type: integer
+          minimum: 10
+          maximum: 100
+          default: 100
+        page:
+          type: string
+    
+    # Respuesta de una búsqueda
+    SearchAccommodationResponse:
+      type: object
+      properties:
+        request_id:
+          type: string
+        data:
+          type: array
+          items:
+            type: object
+            properties:
+              id:
+                type: integer
+              url:
+                type: string
+        next_page:
+          type: string
+          # Puede ser nulo si no hay página siguiente
+          nullable: true
+    
+    # JSON enviado para verificar disponibilidad
+    AvailabilityRequest:
+      type: object
+      required:
+      - accommodation
+      - booker
+      - checkin
+      - checkout
+      - guests
+      properties:
+        accommodation:
+          type: integer
+          minimum: 1
+        booker:
+          $ref: '#/components/schemas/Booker'
+        checkin:
+          type: string
+          format: date
+        checkout:
+          type: string
+          format: date
+        guests:
+          $ref: '#/components/schemas/AccommodationsGuests'
+        currency:
+          type: string
+          pattern: ^[A-Z]{3}$
+        extras:
+          type: array
+          items:
+            type: string
+            enum:
+            - extra_charges
+            - include_bundle_variants
+    
+    AvailabilityResponse:
+      type: object
+      properties:
+        request_id:
+          type: string
+        data:
+          type: object
+          properties:
+            id:
+              type: integer
+            currency:
+              type: string
+            products:
+              type: array
+              items:
+                type: object
+            url:
+              type: string
+    
+    BulkAvailabilityRequest:
+      type: object
+      required:
+      - accommodations
+      - booker
+      - checkin
+      - checkout
+      - guests
+      properties:
+        accommodations:
+          type: array
+          items:
+            type: integer
+        booker:
+          $ref: '#/components/schemas/Booker'
+        checkin:
+          type: string
+          format: date
+        checkout:
+          type: string
+          format: date
+        guests:
+          $ref: '#/components/schemas/AccommodationsGuests'
+        filters:
+          type: object
+          properties:
+            meal_plan:
+              type: string
+            cancellation_type:
+              type: string
+        currency:
+          type: string
+          pattern: ^[A-Z]{3}$
+        extras:
+          type: array
+          items:
+            type: string
+    
+    BulkAvailabilityResponse:
+      type: object
+      properties:
+        request_id:
+          type: string
+        data:
+          type: array
+          items:
+            type: object
+    
+    AccommodationDetailsRequest:
+      type: object
+      properties:
+        accommodations:
+          type: array
+          items:
+            type: integer
+        city:
+          type: integer
+        country:
+          type: string
+        extras:
+          type: array
+          items:
+            type: string
+            enum:
+            - description
+            - bundles
+            - facilities
+            - payment
+            - photos
+            - policies
+            - rooms
+        languages:
+          type: array
+          items:
+            type: string
+    
+    AccommodationDetailsResponse:
+      type: object
+      properties:
+        request_id:
+          type: string
+        data:
+          type: array
+          items:
+            type: object
+        next_page:
+          type: string
+          nullable: true
+    
+    DetailsChangesRequest:
+      type: object
+      required:
+      - last_change
+      properties:
+        last_change:
+          type: string
+          # Fecha y hora completa (ISO 8601)
+          format: date-time
+        filters:
+          type: object
+          properties:
+            countries:
+              type: array
+              items:
+                type: string
+            cities:
+              type: array
+              items:
+                type: integer
+    
+    DetailsChangesResponse:
+      type: object
+      properties:
+        request_id:
+          type: string
+        data:
+          type: object
+          properties:
+            from:
+              type: string
+              format: date-time
+            next:
+              type: string
+              format: date-time
+            total_changes:
+              type: integer
+            changes:
+              type: object
+    
+    ChainsResponse:
+      type: object
+      properties:
+        request_id:
+          type: string
+        data:
+          type: array
+          items:
+            type: object
+            properties:
+              id:
+                type: integer
+              name:
+                type: string
+              brands:
+                type: array
+                items:
+                  type: object
+    
+    ConstantsRequest:
+      type: object
+      properties:
+        languages:
+          type: array
+          items:
+            type: string
+        constants:
+          type: array
+          items:
+            type: string
+    
+    ConstantsResponse:
+      type: object
+      properties:
+        request_id:
+          type: string
+        data:
+          type: object
+    
+    ReviewsRequest:
+      type: object
+      required:
+      - accommodations
+      properties:
+        accommodations:
+          type: array
+          items:
+            type: integer
+        languages:
+          type: array
+          items:
+            type: string
+        page:
+          type: string
+        rows:
+          type: integer
+    
+    ReviewsResponse:
+      type: object
+      properties:
+        request_id:
+          type: string
+        data:
+          type: array
+          items:
+            type: object
+        next_page:
+          type: string
+    
+    ReviewsScoresRequest:
+      type: object
+      required:
+      - accommodations
+      properties:
+        accommodations:
+          type: array
+          items:
+            type: integer
+        languages:
+          type: array
+          items:
+            type: string
+    
+    ReviewsScoresResponse:
+      type: object
+      properties:
+        request_id:
+          type: string
+        data:
+          type: array
+          items:
+            type: object
+    
+    OrderPreviewRequest:
+      type: object
+      required:
+      - accommodation_id
+      - product_id
+      - guests
+      properties:
+        accommodation_id:
+          type: integer
+        product_id:
+          type: string
+        guests:
+          $ref: '#/components/schemas/AccommodationsGuests'
+    
+    OrderPreviewResponse:
+      type: object
+      properties:
+        request_id:
+          type: string
+        data:
+          type: object
+          properties:
+            order_preview_id:
+              type: string
+            total_price:
+              type: number
+            currency:
+              type: string
+    
+    OrderCreateRequest:
+      type: object
+      required:
+      - order_preview_id
+      - payment_reference
+      - customer_details
+      properties:
+        order_preview_id:
+          type: string
+        payment_reference:
+          type: string
+        customer_details:
+          type: object
+          properties:
+            first_name:
+              type: string
+            last_name:
+              type: string
+            email:
+              type: string
+    
+    OrderDetail:
+      type: object
+      properties:
+        order_id:
+          type: string
+          # Un UUID es un identificador único largo (ej. 123e4567-e89b-12d3-a456-426614174000)
+          format: uuid
+        locator:
+          type: string
+          description: Equivalente al PNR (Localizador). Código de confirmación del proveedor (Ej. HILTON-XYZ).
+        status:
+          type: string
+          enum:
+          - CONFIRMED
+          - CANCELLED
+          - PENDING
+        accommodation_details:
+          type: object
+        total_price:
+          type: number
+        currency:
+          type: string
+        creation_date:
+          type: string
+          format: date-time
+        _links:
+          type: object
+          description: "HATEOAS – Acciones disponibles según el estado de la orden (Ej: self, modify, cancel)"
+          additionalProperties:
+            type: string
+            format: uri
+    
+    OrderModifyRequest:
+      type: object
+      properties:
+        guests:
+          $ref: '#/components/schemas/AccommodationsGuests'
+        checkin:
+          type: string
+          format: date
+        checkout:
+          type: string
+          format: date
+    
+    WebhookSubscription:
+      type: object
+      required:
+      - id
+      - url
+      - events
+      properties:
+        id:
+          type: string
+          format: uuid
+        url:
+          type: string
+          format: uri
+        events:
+          type: array
+          items:
+            type: string
+            enum:
+            - ORDER_CONFIRMED
+            - ORDER_CANCELLED
+        secret:
+          type: string
+    
+    WebhookPayload:
+      type: object
+      required:
+      - eventId
+      - eventType
+      - timestamp
+      - resourceId
+      properties:
+        eventId:
+          type: string
+          format: uuid
+        eventType:
+          type: string
+        timestamp:
+          type: string
+          format: date-time
+        resourceId:
+          type: string
+        data:
+          type: object

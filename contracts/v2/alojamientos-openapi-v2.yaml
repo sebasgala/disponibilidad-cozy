@@ -1,0 +1,5191 @@
+openapi: 3.0.3
+info:
+  title: API de Alojamientos y Hospedaje Hotelero (Booking Prototipo RDA2)
+  version: 2.2.0
+  contact:
+    name: Líder de Integración de Alojamientos (MS_ALO)
+    email: jlcadenac@puce.edu.ec
+  x-inventory-grpc:
+    service: inventory.InventoryStockService
+    port: 50051
+    host: rda1-backend-integracion-sistemas.onrender.com
+    note: Host de INGESTA de Booking (el consumidor). Es el mismo para todos los socios. Confirmar el host definitivo con
+      el líder técnico antes de la defensa.
+  description: |
+    # Contrato de Integración — Vertical de Alojamientos (RDA2) · v2.2.0
+
+    **Proveedor:** nodo de Alojamientos (`MS_ALO`). **Consumidor:** ESB / Booking Prototipo.
+    **Estándares:** OpenAPI 3.0.3 · RFC 7807 (Problem Details) · RFC 3339 (fechas) · CloudEvents 1.0 · gRPC/Protobuf v3 (solo stock).
+
+    > **Principio de lectura tolerante.** Los *clientes* DEBEN ignorar campos desconocidos en las respuestas
+    > (se pueden agregar campos sin cambiar la versión mayor). Los *servidores* DEBEN rechazar con `400`
+    > los campos desconocidos en los cuerpos de petición.
+
+    ---
+    ## 1. Convenciones transversales (aplican a TODOS los endpoints)
+
+    | Tema | Regla |
+    |---|---|
+    | **Nombres de campo** | Campos de **integración transversal** (idénticos en las 4 verticales): `snake_case` — `saga_id`, `idempotency_key`, `payment_method`, `payment_reference`, `customer_contact`, `external_order_id`. Campos de **dominio hotelero**: `camelCase`. |
+    | **Fechas de estancia** | `date` (`YYYY-MM-DD`), calendario de **America/Guayaquil (UTC-5, sin horario de verano)**. |
+    | **Instantes** | RFC 3339 `date-time`. El servidor emite con offset explícito (`-05:00`) o `Z`; el cliente DEBE aceptar ambos. |
+    | **Dinero** | Tipo `Money`: **string decimal exacto** con 2 decimales (`"560.00"`), nunca `number` (los flotantes binarios no representan 0.10 con exactitud). La moneda va en `currency` (ISO 4217); este nodo opera solo en `USD`, otra → `422 UNSUPPORTED_CURRENCY`. Cada línea se redondea *half-up* a 2 decimales y **la suma debe cuadrar exacta** (tolerancia 0). Los porcentajes (`ivaPorcentaje`) son `number`. |
+    | **Impuestos** | Se expresan como `ivaPorcentaje` + `ivaValor` (la tarifa NO forma parte del nombre del campo). `iva15Pct` queda **deprecado** hasta v3. |
+    | **Cabecera de correlación** | `X-Correlation-ID` (opcional en la petición; si falta, el servidor la genera). **Siempre** se devuelve en la respuesta. El ESB DEBE enviarla. |
+    | **Códigos 400 vs 422** | `400` = petición malformada o que viola el esquema. `422` = petición bien formada que viola una **regla de negocio** (fechas, capacidad, descuento, documento, horario). |
+    | **Errores** | `application/problem+json` (RFC 7807) con `code` tomado del enum cerrado `ErrorCode`. El `code` es el contrato; `detail` es solo para humanos. |
+    | **Rutas estáticas vs `{id}`** | Las rutas estáticas de un segmento (`/health`, `/eventos`, `/categorias`, `/tipos`, `/orders`, `/reservations`) tienen **precedencia** sobre `/alojamientos/{id}`; esas palabras no pueden ser IDs de propiedad. |
+    | **Paginación** | `page` (≥1, def. 1) y `limit` (1–50, def. 10). La respuesta incluye `metadata` (`total_results`, `page`, `limit`, `total_pages`, `has_next`). |
+    | **Caché / sincronización** | Los GET de catálogo devuelven `ETag` y aceptan `If-None-Match` (→ `304`). El catálogo acepta `actualizadoDesde` para sincronización incremental de las cachés `*_cache` del ESB. |
+    | **Límite de tasa** | Respuestas incluyen `RateLimit-Limit/Remaining/Reset`. Al exceder: `429` + `Retry-After`. |
+    | **Versionado** | Cambios aditivos → versión menor. Cambios incompatibles → nueva versión mayor. Lo deprecado se marca `deprecated: true` y se mantiene **al menos hasta v3**. |
+
+    ### 1.1 Glosario de identificadores (una sola reserva, tres nombres)
+
+    | Nombre | Formato | Quién lo usa | Ejemplo |
+    |---|---|---|---|
+    | `orderId` (= *reservationId*) | UUID v4 | Llave **técnica** del nodo. | `c1a2b3c4-d5e6-7890-1234-567890abcdef` |
+    | `externalOrderId` (= `external_order_id`) | `ORD-HTL-[A-Z0-9]{3,20}` | Llave de **negocio** que el ESB guarda en `facturas_detalle`. | `ORD-HTL-8842` |
+    | `codigoReserva` | `BK-HOTEL-[A-Z0-9]{3,20}` | Código **legible** que ve el huésped. | `BK-HOTEL-9912` |
+
+    **Regla de resolución:** todo parámetro de ruta `{orderId}` / `{id}` de reservas acepta **cualquiera de los tres**. Así la Saga puede
+    compensar usando exactamente el `external_order_id` que persistió, sin guardar nada más.
+
+    ### 1.2 Idempotencia (obligatoria en toda mutación)
+
+    La cabecera `Idempotency-Key` (UUID v4) es **obligatoria** en `orders/create` y `orders/{id}/cancel`. El ESB reintenta (hasta 3 veces, 1 s/2 s/4 s), por lo que:
+
+    | Situación | Respuesta |
+    |---|---|
+    | Primera vez | Procesa y guarda `(clave, huella del cuerpo, respuesta)`. |
+    | Misma clave + **mismo** cuerpo (reintento) | Devuelve **la misma respuesta original** (mismo status y `externalOrderId`) con cabecera `Idempotent-Replayed: true`. No descuenta cupo ni cobra dos veces. |
+    | Misma clave + cuerpo **distinto** | `422` · `IDEMPOTENCY_KEY_REUSED`. |
+    | Misma clave mientras la primera sigue en curso | `409` · `IDEMPOTENCY_IN_PROGRESS` + `Retry-After`. |
+    | Retención | **≥ 24 horas** desde la primera petición. |
+
+    `idempotency_key` en el cuerpo está **deprecado**; si viene, DEBE ser igual a la cabecera (si no, `422 VALIDATION_FAILED`).
+
+    ## 2. Máquina de estados de la reserva
+
+    ```
+    PENDING ──► CONFIRMED ──► CHECKED_IN ──► CHECKED_OUT
+        │            │
+        └────────────┴──► CANCELLED
+    ```
+    | Operación | Estado requerido | Si no se cumple |
+    |---|---|---|
+    | `cancel` | `PENDING`, `CONFIRMED` (o ya `CANCELLED` → **idempotente, 200**) | `409 INVALID_STATE_TRANSITION` (p. ej. `CHECKED_IN`/`CHECKED_OUT`) |
+    | `check-in` | `CONFIRMED` | `409 INVALID_STATE_TRANSITION` |
+    | `checkout` | `CHECKED_IN` | `409 INVALID_STATE_TRANSITION` |
+    | reseña | `CHECKED_OUT` | `409 INVALID_STATE_TRANSITION` |
+
+    ## 3. Contrato síncrono de compra (Saga)
+
+    `POST /alojamientos/orders/create` DEBE responder en **≤ 3000 ms** (timeout del Circuit Breaker del ESB):
+
+    | HTTP | `code` | Significado | Acción del ESB |
+    |---|---|---|---|
+    | **201** | — | Reserva confirmada (`externalOrderId` obligatorio) | Registra despacho `CONFIRMADO_SOCIO` |
+    | **409** | `OUT_OF_STOCK` | Sin habitaciones | **Dispara compensación LIFO** |
+    | **409** | `QUOTE_EXPIRED` / `PRICE_MISMATCH` | Cotización vencida / precio distinto | Re-cotizar; **no** compensa otros pasos |
+    | **422** | `DISCOUNT_EXCEEDS_CONTRACT`, `PROMOTIONS_NOT_ALLOWED`, `CAPACITY_EXCEEDED`, `INVALID_DOCUMENT`, `VALIDATION_FAILED` | Regla de negocio | Compensa (la compra no se puede cumplir) |
+    | **429 / 503 / 504** | `RATE_LIMITED`, `PROVIDER_DISABLED`, `GATEWAY_TIMEOUT` | Nodo no disponible | Reintenta con la **misma** `Idempotency-Key`; si agota, compensa |
+
+    **Recuperación tras timeout:** si el ESB no recibió respuesta, DEBE consultar `GET /alojamientos/orders?saga_id=…` (o `idempotency_key=…`)
+    antes de compensar, para saber si la reserva llegó a crearse.
+
+    **Precio y cotización.** `POST /alojamientos/availability` devuelve un `cotizacionId` y congela el **precio** 30 min (`tarifaValidaHasta`).
+    La cotización **no retiene inventario**: el cupo se descuenta recién en `orders/create` (por eso puede devolver `409 OUT_OF_STOCK`).
+    Si se envía `cotizacionId`, el precio queda fijado a la cotización; si no, el servidor recalcula y `totalPagar` DEBE coincidir (exacto) o responde `409 PRICE_MISMATCH`.
+
+    **Combos.** Si la orden pertenece a un paquete, DEBE enviar `paquete` (`descuentoPorcentaje`, `descuentoMonto`). El nodo valida contra su acuerdo B2B vigente:
+    `descuentoPorcentaje ≤ porcentaje_descuento_maximo`, destino habilitado y vigencia; si no, `422`.
+
+    ## 4. Reglas de dominio hotelero
+
+    * **Check-in digital:** solo desde las **14:00 hora de Guayaquil** del día `checkinFecha` y hasta el `checkoutFecha`. Antes → `422 CHECKIN_TIME_NOT_REACHED` (con `habilitadoDesde` en el problema).
+      La excepción *early check-in* la fija únicamente un administrador con `PUT /alojamientos/orders/{id}/early-checkin`; **el huésped no puede enviarla**.
+    * **Check-out:** hora máxima por propiedad (`checkOutHoraMaxima`, def. 11:00 local).
+    * **Capacidad:** `ocupantes` se valida contra `capacidadAdultos` / `capacidadNinos` × `cantidadHabitaciones` → `422 CAPACITY_EXCEEDED`.
+    * **Estancia:** `1 ≤ noches ≤ 30`; `fechaFin > fechaInicio`; `fechaInicio ≥ hoy (Guayaquil)`.
+    * **Documento del titular:** `CEDULA` = 10 dígitos + **módulo 10**; `RUC` = 13 dígitos; `PASAPORTE` = 6–12 alfanuméricos. Falla → `422 INVALID_DOCUMENT`.
+    * **Fórmula de precio:** `subtotal` = suma de `nochesDetalle`; `ivaValor = round_half_up(subtotal × ivaPorcentaje / 100)`; `tasaMunicipal` = USD 2.00 por noche y habitación; `total = subtotal + ivaValor + tasaMunicipal − descuentoCombo`.
+    * **Reembolsos:** la compensación de Saga (`solicitadoPor = SAGA_ORCHESTRATOR`) reembolsa **100 %** siempre. La cancelación de un usuario sigue `politicaCancelacion` (ventana `horasLimiteCancelacion`).
+
+    ### 4.1 Planes de tarifa y restricciones (modelo ARI)
+
+    Una habitación se vende con uno o más **planes de tarifa** (`RatePlanV2`): reembolsable o no, con o sin desayuno, prepago o pago en hotel. Cada plan trae su propia política de cancelación y su precio por ocupación (`ocupacionBase`, `suplementoAdultoExtra`, `politicaNinos`).
+    `GET /alojamientos/{id}/habitaciones` los lista; `planTarifaCodigo` los selecciona (si falta, plan por defecto).
+
+    Cada noche puede llevar **restricciones** (`RestriccionesDiaV2`). Violarlas → `422 RESTRICTION_VIOLATED` con el campo `restriccion`:
+
+    | `restriccion` | Se evalúa sobre | Regla |
+    |---|---|---|
+    | `MIN_STAY` / `MAX_STAY` | noche de **llegada** | noches ∈ [`estanciaMinima`, `estanciaMaxima`] |
+    | `CLOSED_TO_ARRIVAL` | noche de llegada | `cerradoALlegada = false` |
+    | `CLOSED_TO_DEPARTURE` | fecha `fechaFin` | `cerradoASalida = false` |
+    | `STOP_SELL` | **cada** noche | `ventaCerrada = false` en todas |
+    | `CUTOFF` | ahora vs 14:00 de llegada | horas ≥ `anticipacionMinimaHoras` |
+
+    Las restricciones y tarifas por noche se leen en `GET /alojamientos/{id}/inventario` (`tarifas[]`). Las validaciones se aplican tanto en `POST /availability` como en `orders/create`.
+
+    ## 5. Sincronización de stock — gRPC (no REST)
+
+    Las compras viajan por REST; **el stock viaja por gRPC** (HTTP/2, puerto **50051**) hacia el host de ingesta de Booking (`info.x-inventory-grpc`).
+
+    * `item_id` = `<alojamientoId>:<tipoHabitacionCodigo>` (ej. `HTL-QUITO-001:SUITE_DELUXE`).
+    * **Una actualización por noche de estancia.** Una reserva de 4 noches emite **4** mensajes (`date` = cada noche, `check-in … check-out − 1`).
+    * `PushStockUpdate` envía `available_units` **absoluto**; `StreamInventoryChanges` envía `delta` (+1/−1) con `event_id` único (idempotente).
+    * Se emite al **reservar, cancelar, bloquear** una habitación y al cargar inventario.
+    * **Reconciliación:** si Booking detecta un `last_sync_hash` distinto, consulta `GET /alojamientos/{id}/inventario?desde=&hasta=` (fuente de verdad) y corrige.
+
+    ```protobuf
+    syntax = "proto3";
+    package inventory;
+    service InventoryStockService {
+      rpc PushStockUpdate (StockUpdateMessage) returns (StockUpdateAck);
+      rpc StreamInventoryChanges (stream StockChangeEvent) returns (StreamSummary);
+    }
+    message StockUpdateMessage { string service_id = 1; string item_id = 2; string date = 3;
+      string time_slot = 4; int32 available_units = 5; int64 timestamp = 6; }
+    message StockUpdateAck { bool success = 1; string message = 2; int64 processed_at = 3; }
+    message StockChangeEvent { string event_id = 1; string service_id = 2; string item_id = 3;
+      string date = 4; string time_slot = 5; int32 delta = 6; int64 timestamp = 7; }
+    message StreamSummary { int32 total_events_processed = 1; bool is_synchronized = 2; string last_sync_hash = 3; }
+    ```
+    Para alojamientos `service_id = "alojamientos"` (o el código del nodo) y `time_slot = "14:00"`.
+
+    ## 6. Promociones y combos (Cátedra RDA2 §9)
+
+    El partner declara **una sola vez** si acepta promociones y el **porcentaje máximo** de descuento (`GET/PUT /alojamientos/promociones/contrato`).
+    Si `permite_promociones = false` el porcentaje DEBE ser `0`. Cada orden con `paquete` se valida contra ese acuerdo (§3).
+
+    ## 7. Seguridad, roles y protección de datos
+
+    | Esquema | Uso |
+    |---|---|
+    | `OAuth2ClientCredentials` | **Máquina a máquina** ESB ⇄ nodo. Token ≤ 15 min; **un scope por tipo de operación** (tabla abajo). |
+    | `BearerAuth` (JWT) | Usuario final / administradores. Claims `sub`, `roles` ∈ {`CLIENTE`, `ADMIN`, `MANTENIMIENTO`}. |
+    | `ApiKeyAuth` | **Deprecado** (hasta v3): llave heredada para integraciones existentes. |
+
+    | Scope | Operaciones |
+    |---|---|
+    | `alojamientos:book` | `createOrder` |
+    | `alojamientos:cancel` | `cancelOrder` |
+    | `alojamientos:read` | `getOrder`, `listOrders`, `getPromotionContract` |
+    | `alojamientos:checkin` | `checkInOrder`, `checkOutOrder` |
+    | `alojamientos:inventory` | `getInventorySnapshot`, `listOutboxEvents` |
+    | `alojamientos:admin` | `putPromotionContract`, `setEarlyCheckin` |
+
+    Token sin el scope → `403 INSUFFICIENT_SCOPE` (con `scopes_requeridos`). Catálogo y disponibilidad son **públicos** (`security: []`). **No hay mutaciones anónimas.**
+    Autorización por objeto: un `CLIENTE` solo accede a reservas donde `huespedTitular` / `sub` coincide; de lo contrario `403 FORBIDDEN`. `ADMIN` y los tokens de servicio con scope acceden a todas.
+
+    ### 7.1 Protección de datos personales (LOPDP, Ecuador)
+
+    * Los campos con `x-pii: true` son datos personales; `x-secret: true` marca credenciales (la clave digital de la habitación).
+    * **Minimización:** los eventos del feed outbox y el stream gRPC **no contienen PII** (solo identificadores de reserva y cifras de inventario). Verificado por prueba automática.
+    * **Logs y trazas:** no registrar campos `x-pii` ni `x-secret`; `X-Correlation-ID` nunca debe contener datos personales.
+    * **Transporte:** solo TLS ≥ 1.2. **Retención:** datos del huésped mientras dure la obligación fiscal/contractual; luego anonimizar.
+    * El acceso a PII de otra persona exige el rol/scope correspondiente y queda auditado con el `X-Correlation-ID`.
+
+    ## 8. Resiliencia y kill-switch
+
+    Cuando el administrador apaga el nodo (kill-switch / circuit breaker `MANUALLY_OPEN`), toda mutación responde `503 PROVIDER_DISABLED` con `Retry-After`;
+    `GET /alojamientos/health` responde `503` con `status = DOWN`. Las lecturas de catálogo pueden servirse desde la caché del ESB (`datos_en_cache: true` en el ESB).
+
+    ## 9. Migración 2.0.0 → 2.2.0
+
+    **Aditivo (no rompe):** `cotizacionId`, `paquete`, `GET /orders`, `GET /{id}/inventario`, `PUT …/early-checkin`, `metadata` de paginación, `ETag`, `operationId`, nuevos `ErrorCode`, `ivaPorcentaje`/`ivaValor`/`impuestos[]`, `semaforo`, `Idempotent-Replayed`, `403/429/5xx` declarados, **planes de tarifa** (`planesTarifa`, `planTarifaCodigo`, opcional: sin él se usa el plan por defecto) y **restricciones** (`tarifas[]` en `/inventario`, `RESTRICTION_VIOLATED`).
+
+    **Cambios que requieren acción del consumidor:**
+    1. **Dinero: de `number` a `Money` (string decimal `"560.00"`)** en todas las peticiones y respuestas (`totalPagar`, `total`, `subtotal`, …). Los parámetros `minPrecio` / `maxPrecio` también.
+    2. `ocupantes` pasa a ser **obligatorio** en `orders/create`.
+    3. `early_checkin_autorizado` **se elimina** del cuerpo de check-in (era manipulable por el huésped).
+    4. Se eliminan los accesos **anónimos** de reservas; el ESB usa `OAuth2ClientCredentials` (con `ApiKeyAuth` deprecado como transición).
+    5. `ReservationSummary.status` unifica el enum con `OrderDetail.estado`.
+    6. `code` canónico de falta de stock = `OUT_OF_STOCK` (`ROOM_NO_LONGER_AVAILABLE` queda deprecado).
+    7. `GET /alojamientos/eventos`: `after` pasa de string a **entero** (`sequence`).
+    8. Health: se elimina `database.schema` (filtraba el nombre interno del esquema).
+    9. `AvailabilityOption` ahora es por *(habitación, plan)* y exige `planTarifaCodigo`; `DesglosePrecio` exige `nochesDetalle`.
+servers:
+- url: https://rda1-backend-integracion-sistemas.onrender.com/api/v2
+  description: Servidor de Producción Desplegado en Render (HTTPS Cloud)
+- url: http://localhost:3000/api/v2
+  description: Gateway NestJS local
+- url: http://localhost:3010/api/v2
+  description: Microservicio autónomo MS_ALO (desarrollo local)
+security:
+- OAuth2ClientCredentials: []
+- BearerAuth: []
+tags:
+- name: Alojamientos - Catálogo y Búsqueda v2
+  description: Catálogo, búsqueda, filtros y taxonomía. Públicos, cacheables (ETag).
+- name: Alojamientos - Propiedades y Habitaciones v2
+  description: Ficha técnica, tipos de habitación y régimen.
+- name: Alojamientos - Disponibilidad y Cotización v2
+  description: Disponibilidad en tiempo real, cotización con precio congelado e inventario por noche.
+- name: Alojamientos - Reservas y Órdenes Saga v2
+  description: Compra síncrona, consulta, listado y cancelación compensatoria (idempotentes).
+- name: Alojamientos - Check-in y Check-out Digital v2
+  description: Check-in desde las 14:00 (Guayaquil), early check-in administrado y check-out.
+- name: Alojamientos - Reseñas y Calificaciones v2
+  description: Reseñas de huéspedes con estancia verificada.
+- name: Alojamientos - Promociones B2B y Combos v2
+  description: Acuerdo comercial de promociones (Cátedra RDA2 §9).
+- name: Alojamientos - Telemetría y Salud de Nodo v2
+  description: Health (semáforo), feed Outbox y trazabilidad.
+paths:
+  /alojamientos/health:
+    get:
+      operationId: getHealth
+      tags:
+      - Alojamientos - Telemetría y Salud de Nodo v2
+      summary: Healthcheck y telemetría del nodo (semáforo del Panel 1)
+      description: |
+        Consumido cada 5 s por el Monitor de Nodos. Semáforo: `GREEN` < 200 ms · `YELLOW` 200–800 ms · `RED` > 800 ms o caída.
+        Con el nodo apagado por kill-switch responde `503` con `status = DOWN`.
+      security: []
+      parameters:
+      - $ref: '#/components/parameters/CorrelationIdHeader'
+      responses:
+        '200':
+          description: Nodo operativo (HEALTHY o DEGRADED)
+          headers:
+            X-Correlation-ID:
+              $ref: '#/components/headers/X-Correlation-ID'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AlojamientosHealthResponseV2'
+        '400':
+          $ref: '#/components/responses/BadRequest400'
+        '503':
+          description: Nodo caído o deshabilitado (el cuerpo sigue el mismo esquema, con `status = DOWN`)
+          headers:
+            X-Correlation-ID:
+              $ref: '#/components/headers/X-Correlation-ID'
+            Retry-After:
+              $ref: '#/components/headers/Retry-After'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AlojamientosHealthResponseV2'
+  /alojamientos/promociones/contrato:
+    get:
+      operationId: getPromotionContract
+      tags:
+      - Alojamientos - Promociones B2B y Combos v2
+      summary: Consultar el acuerdo B2B vigente de promociones y combos
+      description: Retorna si el partner acepta promociones y el porcentaje máximo de descuento autorizado.
+      parameters:
+      - $ref: '#/components/parameters/CorrelationIdHeader'
+      responses:
+        '200':
+          description: Acuerdo vigente
+          headers:
+            X-Correlation-ID:
+              $ref: '#/components/headers/X-Correlation-ID'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ContratoPromocionesResponseV2'
+        '400':
+          $ref: '#/components/responses/BadRequest400'
+        '401':
+          $ref: '#/components/responses/Unauthorized401'
+        '403':
+          $ref: '#/components/responses/Forbidden403'
+        '429':
+          $ref: '#/components/responses/TooManyRequests429'
+        '500':
+          $ref: '#/components/responses/InternalError500'
+      security:
+      - OAuth2ClientCredentials:
+        - alojamientos:read
+      - BearerAuth: []
+      - ApiKeyAuth: []
+    put:
+      operationId: putPromotionContract
+      tags:
+      - Alojamientos - Promociones B2B y Combos v2
+      summary: Formalizar o actualizar el acuerdo B2B (solo ADMIN)
+      description: |
+        Responde el cuestionario de la cátedra: ¿acepta promociones? ¿porcentaje máximo? ¿destinos? ¿vigencia?
+        **Rol requerido: `ADMIN`.** Si `permite_promociones = false`, `porcentaje_descuento_maximo` DEBE ser `0` (si no, `422`).
+        La operación es idempotente por naturaleza (PUT): repetir el mismo cuerpo produce el mismo estado.
+      security:
+      - OAuth2ClientCredentials:
+        - alojamientos:admin
+      - BearerAuth: []
+      x-required-roles:
+      - ADMIN
+      parameters:
+      - $ref: '#/components/parameters/CorrelationIdHeader'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ContratoPromocionesRequestV2'
+      responses:
+        '200':
+          description: Acuerdo formalizado
+          headers:
+            X-Correlation-ID:
+              $ref: '#/components/headers/X-Correlation-ID'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ContratoPromocionesResponseV2'
+        '400':
+          $ref: '#/components/responses/BadRequest400'
+        '401':
+          $ref: '#/components/responses/Unauthorized401'
+        '403':
+          $ref: '#/components/responses/Forbidden403'
+        '422':
+          $ref: '#/components/responses/Unprocessable422'
+        '429':
+          $ref: '#/components/responses/TooManyRequests429'
+        '500':
+          $ref: '#/components/responses/InternalError500'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable503'
+  /alojamientos/eventos:
+    get:
+      operationId: listOutboxEvents
+      tags:
+      - Alojamientos - Telemetría y Salud de Nodo v2
+      summary: Feed Transactional Outbox (CloudEvents) para RabbitMQ / EDA
+      description: |
+        Eventos en orden estricto por `sequence` (entero monótono creciente, sin saltos). El consumidor guarda el último `sequence`
+        procesado y lo envía en `after`. Entrega **al menos una vez**: el consumidor DEBE deduplicar por `id`.
+      security:
+      - OAuth2ClientCredentials:
+        - alojamientos:inventory
+      - ApiKeyAuth: []
+      x-required-roles:
+      - SERVICE
+      - ADMIN
+      parameters:
+      - name: after
+        in: query
+        description: Último `sequence` ya procesado (retorna solo eventos con `sequence` mayor).
+        schema:
+          type: integer
+          format: int64
+          minimum: 0
+          default: 0
+          maximum: 9223372036854775807
+        example: 1042
+      - name: limit
+        in: query
+        schema:
+          type: integer
+          minimum: 1
+          maximum: 200
+          default: 50
+      - name: type
+        in: query
+        description: Filtra por tipo de evento.
+        schema:
+          $ref: '#/components/schemas/EventType'
+      - $ref: '#/components/parameters/CorrelationIdHeader'
+      responses:
+        '200':
+          description: Lote de eventos
+          headers:
+            X-Correlation-ID:
+              $ref: '#/components/headers/X-Correlation-ID'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AlojamientosEventosResponseV2'
+        '400':
+          $ref: '#/components/responses/BadRequest400'
+        '401':
+          $ref: '#/components/responses/Unauthorized401'
+        '403':
+          $ref: '#/components/responses/Forbidden403'
+        '429':
+          $ref: '#/components/responses/TooManyRequests429'
+        '500':
+          $ref: '#/components/responses/InternalError500'
+  /alojamientos:
+    get:
+      operationId: listAlojamientos
+      tags:
+      - Alojamientos - Catálogo y Búsqueda v2
+      summary: Catálogo paginado de propiedades de hospedaje
+      description: |
+        Admite `ETag`/`If-None-Match` y sincronización incremental con `actualizadoDesde` (para las cachés `*_cache` del ESB).
+      security: []
+      parameters:
+      - name: ciudad
+        in: query
+        schema:
+          type: string
+          maxLength: 80
+        example: Quito
+      - name: estrellas
+        in: query
+        schema:
+          type: integer
+          minimum: 1
+          maximum: 5
+      - name: minPrecio
+        in: query
+        schema:
+          $ref: '#/components/schemas/Money'
+        description: Importe `Money` (string decimal, p. ej. `"120.00"`).
+      - name: maxPrecio
+        in: query
+        schema:
+          $ref: '#/components/schemas/Money'
+        description: Importe `Money` (string decimal, p. ej. `"120.00"`).
+      - name: permitePaquete
+        in: query
+        description: Solo propiedades que aceptan combos.
+        schema:
+          type: boolean
+      - name: actualizadoDesde
+        in: query
+        description: Solo registros modificados desde este instante (RFC 3339).
+        schema:
+          type: string
+          format: date-time
+      - $ref: '#/components/parameters/PageParam'
+      - $ref: '#/components/parameters/LimitParam'
+      - $ref: '#/components/parameters/IfNoneMatchHeader'
+      - $ref: '#/components/parameters/CorrelationIdHeader'
+      responses:
+        '200':
+          description: Catálogo recuperado
+          headers:
+            X-Correlation-ID:
+              $ref: '#/components/headers/X-Correlation-ID'
+            ETag:
+              $ref: '#/components/headers/ETag'
+            RateLimit-Remaining:
+              $ref: '#/components/headers/RateLimit-Remaining'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AlojamientoListResponseV2'
+        '304':
+          $ref: '#/components/responses/NotModified304'
+        '400':
+          $ref: '#/components/responses/BadRequest400'
+        '429':
+          $ref: '#/components/responses/TooManyRequests429'
+        '500':
+          $ref: '#/components/responses/InternalError500'
+  /alojamientos/search:
+    post:
+      operationId: searchAlojamientos
+      tags:
+      - Alojamientos - Catálogo y Búsqueda v2
+      summary: Búsqueda avanzada con fechas y ocupantes
+      description: |
+        Calcula `precioTotalEstancia` para el rango y ocupantes solicitados. No retiene inventario ni congela precio
+        (para eso use `POST /alojamientos/availability`).
+      security: []
+      parameters:
+      - $ref: '#/components/parameters/PageParam'
+      - $ref: '#/components/parameters/LimitParam'
+      - $ref: '#/components/parameters/CorrelationIdHeader'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SearchAccommodationRequestV2'
+      responses:
+        '200':
+          description: Resultados
+          headers:
+            X-Correlation-ID:
+              $ref: '#/components/headers/X-Correlation-ID'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SearchAccommodationResponseV2'
+        '400':
+          $ref: '#/components/responses/BadRequest400'
+        '422':
+          $ref: '#/components/responses/Unprocessable422'
+        '429':
+          $ref: '#/components/responses/TooManyRequests429'
+        '500':
+          $ref: '#/components/responses/InternalError500'
+  /alojamientos/categorias:
+    get:
+      operationId: listCategorias
+      tags:
+      - Alojamientos - Catálogo y Búsqueda v2
+      summary: Taxonomía de tipos de alojamiento
+      security: []
+      parameters:
+      - $ref: '#/components/parameters/IfNoneMatchHeader'
+      - $ref: '#/components/parameters/CorrelationIdHeader'
+      responses:
+        '200':
+          description: Categorías
+          headers:
+            X-Correlation-ID:
+              $ref: '#/components/headers/X-Correlation-ID'
+            ETag:
+              $ref: '#/components/headers/ETag'
+          content:
+            application/json:
+              schema:
+                type: array
+                maxItems: 100
+                items:
+                  $ref: '#/components/schemas/CategoriaAlojamientoV2'
+        '304':
+          $ref: '#/components/responses/NotModified304'
+        '400':
+          $ref: '#/components/responses/BadRequest400'
+        '429':
+          $ref: '#/components/responses/TooManyRequests429'
+        '500':
+          $ref: '#/components/responses/InternalError500'
+  /alojamientos/availability:
+    post:
+      operationId: quoteAvailability
+      tags:
+      - Alojamientos - Disponibilidad y Cotización v2
+      summary: Disponibilidad exacta de un tipo de habitación + cotización con precio congelado
+      description: |-
+        Devuelve `cotizacionId` y congela el **precio** hasta `tarifaValidaHasta` (30 min). **No reserva inventario.**
+        Envíe el `cotizacionId` en `orders/create` para honrar el precio. Si ya no hay cupo, responde `409 OUT_OF_STOCK`.
+
+
+        Valida las **restricciones** del plan (estancia mínima/máxima, cerrado a llegada/salida, stop-sell, cut-off): `422 RESTRICTION_VIOLATED` (ver §4.1). Moneda distinta de USD → `422 UNSUPPORTED_CURRENCY`.
+      security: []
+      parameters:
+      - $ref: '#/components/parameters/CorrelationIdHeader'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AvailabilityRequestV2'
+      responses:
+        '200':
+          description: Disponible y cotizado
+          headers:
+            X-Correlation-ID:
+              $ref: '#/components/headers/X-Correlation-ID'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AvailabilityResponseV2'
+        '400':
+          $ref: '#/components/responses/BadRequest400'
+        '404':
+          $ref: '#/components/responses/NotFound404'
+        '409':
+          $ref: '#/components/responses/Conflict409'
+        '422':
+          $ref: '#/components/responses/Unprocessable422'
+        '429':
+          $ref: '#/components/responses/TooManyRequests429'
+        '500':
+          $ref: '#/components/responses/InternalError500'
+  /alojamientos/orders/create:
+    post:
+      operationId: createOrder
+      tags:
+      - Alojamientos - Reservas y Órdenes Saga v2
+      summary: Crear reserva (contrato síncrono obligatorio de Saga, ≤ 3000 ms)
+      description: |-
+        Invocado por el ESB en el checkout. **Idempotente** (ver §1.2). Responde `201` con `externalOrderId` o `409 OUT_OF_STOCK`
+        (activa la compensación LIFO). Tabla completa de códigos en §3.
+
+        Validaciones de negocio (→ `422`): fechas y estancia, capacidad de ocupantes, documento del titular (módulo 10),
+        descuento de `paquete` vs acuerdo B2B, y coherencia de `totalPagar` con la cotización (→ `409 PRICE_MISMATCH` / `QUOTE_EXPIRED`).
+
+
+        Valida las **restricciones** del plan (estancia mínima/máxima, cerrado a llegada/salida, stop-sell, cut-off): `422 RESTRICTION_VIOLATED` (ver §4.1). Moneda distinta de USD → `422 UNSUPPORTED_CURRENCY`.
+      x-saga-step: forward
+      x-sla-ms: 3000
+      parameters:
+      - $ref: '#/components/parameters/IdempotencyKeyHeader'
+      - $ref: '#/components/parameters/CorrelationIdHeader'
+      - $ref: '#/components/parameters/NodeIdHeader'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/OrderCreateRequestV2'
+            examples:
+              reservaSimple:
+                summary: Suite Deluxe 4 noches (con cotización congelada)
+                value:
+                  alojamientoId: HTL-QUITO-001
+                  tipoHabitacionCodigo: SUITE_DELUXE
+                  fechaInicio: '2026-11-01'
+                  fechaFin: '2026-11-05'
+                  cantidadHabitaciones: 1
+                  ocupantes:
+                    adultos: 2
+                    ninos: 0
+                  regimenSeleccionado: DESAYUNO_INCLUIDO
+                  cotizacionId: 3f2b8a52-6d3e-4a43-9a0e-1f6d7a9b2c11
+                  totalPagar: '560.00'
+                  currency: USD
+                  payment_method: TARJETA_CREDITO
+                  payment_reference: AUTH-VISA-982341
+                  saga_id: 6ba7b810-9dad-11d1-80b4-00c04fd430c8
+                  huespedTitular:
+                    nombreCompleto: Joselyn Cadena
+                    tipoDocumento: CEDULA
+                    identificacion: '1712345675'
+                    email: jlcadenac@puce.edu.ec
+                    telefono: '+593991234567'
+                    nacionalidad: Ecuatoriana
+                  planTarifaCodigo: FLEX_BB
+              reservaConCombo:
+                summary: Reserva dentro de un paquete con 10 % de descuento
+                value:
+                  alojamientoId: HTL-QUITO-001
+                  tipoHabitacionCodigo: SUITE_DELUXE
+                  fechaInicio: '2026-11-01'
+                  fechaFin: '2026-11-05'
+                  ocupantes:
+                    adultos: 2
+                    ninos: 0
+                  totalPagar: '512.00'
+                  paquete:
+                    paqueteId: 0b5f9d7e-2c11-4f43-8f1a-5d7c3a2e9b10
+                    descuentoPorcentaje: 10.0
+                    descuentoMonto: '48.00'
+                  payment_method: TARJETA_CREDITO
+                  saga_id: 6ba7b810-9dad-11d1-80b4-00c04fd430c8
+                  huespedTitular:
+                    nombreCompleto: Joselyn Cadena
+                    tipoDocumento: CEDULA
+                    identificacion: '1712345675'
+                    email: jlcadenac@puce.edu.ec
+                    telefono: '+593991234567'
+      responses:
+        '201':
+          description: 'Reserva confirmada. Si es un reintento idempotente, la cabecera `Idempotent-Replayed: true` está presente.'
+          headers:
+            X-Correlation-ID:
+              $ref: '#/components/headers/X-Correlation-ID'
+            Location:
+              $ref: '#/components/headers/Location'
+            Idempotent-Replayed:
+              $ref: '#/components/headers/Idempotent-Replayed'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OrderDetailV2'
+        '400':
+          $ref: '#/components/responses/BadRequest400'
+        '401':
+          $ref: '#/components/responses/Unauthorized401'
+        '403':
+          $ref: '#/components/responses/Forbidden403'
+        '404':
+          $ref: '#/components/responses/NotFound404'
+        '409':
+          $ref: '#/components/responses/ConflictOrder409'
+        '422':
+          $ref: '#/components/responses/Unprocessable422'
+        '429':
+          $ref: '#/components/responses/TooManyRequests429'
+        '500':
+          $ref: '#/components/responses/InternalError500'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable503'
+        '504':
+          $ref: '#/components/responses/GatewayTimeout504'
+      security:
+      - OAuth2ClientCredentials:
+        - alojamientos:book
+      - BearerAuth: []
+      - ApiKeyAuth: []
+  /alojamientos/orders:
+    get:
+      operationId: listOrders
+      tags:
+      - Alojamientos - Reservas y Órdenes Saga v2
+      summary: Buscar órdenes (recuperación de Saga y conciliación)
+      description: |
+        Permite al ESB saber si una reserva llegó a crearse tras un timeout (`saga_id`, `idempotency_key`, `external_order_id`)
+        y conciliar por rango de fechas/estado. Rol `SERVICE` o `ADMIN`.
+      security:
+      - OAuth2ClientCredentials:
+        - alojamientos:read
+      - ApiKeyAuth: []
+      - BearerAuth: []
+      x-required-roles:
+      - SERVICE
+      - ADMIN
+      parameters:
+      - name: saga_id
+        in: query
+        schema:
+          type: string
+          maxLength: 64
+      - name: idempotency_key
+        in: query
+        schema:
+          type: string
+          format: uuid
+      - name: external_order_id
+        in: query
+        schema:
+          type: string
+          pattern: ^ORD-HTL-[A-Z0-9]{3,20}$
+      - name: estado
+        in: query
+        schema:
+          $ref: '#/components/schemas/ReservationStatus'
+      - name: creadoDesde
+        in: query
+        schema:
+          type: string
+          format: date-time
+      - name: creadoHasta
+        in: query
+        schema:
+          type: string
+          format: date-time
+      - $ref: '#/components/parameters/PageParam'
+      - $ref: '#/components/parameters/LimitParam'
+      - $ref: '#/components/parameters/CorrelationIdHeader'
+      responses:
+        '200':
+          description: Órdenes que cumplen el filtro (lista vacía si ninguna)
+          headers:
+            X-Correlation-ID:
+              $ref: '#/components/headers/X-Correlation-ID'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OrderListResponseV2'
+        '400':
+          $ref: '#/components/responses/BadRequest400'
+        '401':
+          $ref: '#/components/responses/Unauthorized401'
+        '403':
+          $ref: '#/components/responses/Forbidden403'
+        '429':
+          $ref: '#/components/responses/TooManyRequests429'
+        '500':
+          $ref: '#/components/responses/InternalError500'
+  /alojamientos/orders/{orderId}:
+    get:
+      operationId: getOrder
+      tags:
+      - Alojamientos - Reservas y Órdenes Saga v2
+      summary: Detalle y estado de una reserva
+      description: Acepta `orderId` (UUID), `externalOrderId` o `codigoReserva`. Un `CLIENTE` solo ve las suyas (`403` si
+        no).
+      parameters:
+      - $ref: '#/components/parameters/OrderRefPath'
+      - $ref: '#/components/parameters/CorrelationIdHeader'
+      responses:
+        '200':
+          description: Reserva
+          headers:
+            X-Correlation-ID:
+              $ref: '#/components/headers/X-Correlation-ID'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OrderDetailV2'
+        '400':
+          $ref: '#/components/responses/BadRequest400'
+        '401':
+          $ref: '#/components/responses/Unauthorized401'
+        '403':
+          $ref: '#/components/responses/Forbidden403'
+        '404':
+          $ref: '#/components/responses/NotFound404'
+        '429':
+          $ref: '#/components/responses/TooManyRequests429'
+        '500':
+          $ref: '#/components/responses/InternalError500'
+      security:
+      - OAuth2ClientCredentials:
+        - alojamientos:read
+      - BearerAuth: []
+      - ApiKeyAuth: []
+  /alojamientos/orders/{orderId}/cancel:
+    post:
+      operationId: cancelOrder
+      tags:
+      - Alojamientos - Reservas y Órdenes Saga v2
+      summary: Cancelar reserva (acción compensatoria de Saga)
+      description: |
+        **Idempotente** y seguro de reintentar: cancelar una reserva ya `CANCELLED` devuelve `200` con `yaCancelada: true`
+        y el **mismo** `codigoReembolso`. Libera la habitación y emite `stock` (gRPC) + evento `alojamiento.reserva.cancelada`.
+
+        * `solicitadoPor = SAGA_ORCHESTRATOR` → reembolso **100 %** siempre.
+        * `solicitadoPor = CLIENTE` → según `politicaCancelacion` (fuera de ventana se aplica `penalidad`).
+        * Estados `CHECKED_IN` / `CHECKED_OUT` → `409 INVALID_STATE_TRANSITION`.
+      x-saga-step: compensation
+      parameters:
+      - $ref: '#/components/parameters/OrderRefPath'
+      - $ref: '#/components/parameters/IdempotencyKeyHeader'
+      - $ref: '#/components/parameters/CorrelationIdHeader'
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CancelOrderRequestV2'
+      responses:
+        '200':
+          description: Cancelada (o ya lo estaba) y cupo restaurado
+          headers:
+            X-Correlation-ID:
+              $ref: '#/components/headers/X-Correlation-ID'
+            Idempotent-Replayed:
+              $ref: '#/components/headers/Idempotent-Replayed'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CancelOrderResponseV2'
+        '400':
+          $ref: '#/components/responses/BadRequest400'
+        '401':
+          $ref: '#/components/responses/Unauthorized401'
+        '403':
+          $ref: '#/components/responses/Forbidden403'
+        '404':
+          $ref: '#/components/responses/NotFound404'
+        '409':
+          $ref: '#/components/responses/ConflictState409'
+        '422':
+          $ref: '#/components/responses/Unprocessable422'
+        '429':
+          $ref: '#/components/responses/TooManyRequests429'
+        '500':
+          $ref: '#/components/responses/InternalError500'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable503'
+        '504':
+          $ref: '#/components/responses/GatewayTimeout504'
+      security:
+      - OAuth2ClientCredentials:
+        - alojamientos:cancel
+      - BearerAuth: []
+      - ApiKeyAuth: []
+  /alojamientos/orders/{orderId}/check-in:
+    post:
+      operationId: checkInOrder
+      tags:
+      - Alojamientos - Check-in y Check-out Digital v2
+      summary: Check-in digital (desde las 14:00 hora de Guayaquil)
+      description: |
+        Permitido solo si el instante actual ≥ `checkinFecha` 14:00 (America/Guayaquil) y la reserva está `CONFIRMED`.
+        Antes → `422 CHECKIN_TIME_NOT_REACHED` con `habilitadoDesde`. Excepción: la reserva tiene `earlyCheckinAutorizado = true`
+        (fijado por un ADMIN, nunca por el huésped). Emite `alojamiento.checkin.completado`.
+        Un `CLIENTE` solo puede hacer check-in de **su** reserva (`403 FORBIDDEN` si el token no pertenece al titular). Si el token es correcto pero `titularIdentificacion` del cuerpo no coincide con el titular → `422 INVALID_DOCUMENT`.
+      parameters:
+      - $ref: '#/components/parameters/OrderRefPath'
+      - $ref: '#/components/parameters/CorrelationIdHeader'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CheckInRequestV2'
+      responses:
+        '200':
+          description: Check-in completado, habitación y PIN entregados
+          headers:
+            X-Correlation-ID:
+              $ref: '#/components/headers/X-Correlation-ID'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CheckInResponseV2'
+        '400':
+          $ref: '#/components/responses/BadRequest400'
+        '401':
+          $ref: '#/components/responses/Unauthorized401'
+        '403':
+          $ref: '#/components/responses/Forbidden403'
+        '404':
+          $ref: '#/components/responses/NotFound404'
+        '409':
+          $ref: '#/components/responses/ConflictState409'
+        '422':
+          $ref: '#/components/responses/UnprocessableCheckin422'
+        '429':
+          $ref: '#/components/responses/TooManyRequests429'
+        '500':
+          $ref: '#/components/responses/InternalError500'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable503'
+      security:
+      - OAuth2ClientCredentials:
+        - alojamientos:checkin
+      - BearerAuth: []
+  /alojamientos/orders/{orderId}/early-checkin:
+    put:
+      operationId: setEarlyCheckin
+      tags:
+      - Alojamientos - Check-in y Check-out Digital v2
+      summary: Autorizar early check-in (solo ADMIN / recepción)
+      description: |
+        Fija `earlyCheckinAutorizado` y opcionalmente la hora desde la cual se permite. Idempotente (PUT).
+        Reemplaza al antiguo flag `early_checkin_autorizado` del cuerpo de check-in, que podía enviar el propio huésped.
+      security:
+      - OAuth2ClientCredentials:
+        - alojamientos:admin
+      - BearerAuth: []
+      x-required-roles:
+      - ADMIN
+      parameters:
+      - $ref: '#/components/parameters/OrderRefPath'
+      - $ref: '#/components/parameters/CorrelationIdHeader'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/EarlyCheckinRequestV2'
+      responses:
+        '200':
+          description: Autorización registrada
+          headers:
+            X-Correlation-ID:
+              $ref: '#/components/headers/X-Correlation-ID'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OrderDetailV2'
+        '400':
+          $ref: '#/components/responses/BadRequest400'
+        '401':
+          $ref: '#/components/responses/Unauthorized401'
+        '403':
+          $ref: '#/components/responses/Forbidden403'
+        '404':
+          $ref: '#/components/responses/NotFound404'
+        '409':
+          $ref: '#/components/responses/ConflictState409'
+        '429':
+          $ref: '#/components/responses/TooManyRequests429'
+        '500':
+          $ref: '#/components/responses/InternalError500'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable503'
+  /alojamientos/orders/{orderId}/checkout:
+    post:
+      operationId: checkOutOrder
+      tags:
+      - Alojamientos - Check-in y Check-out Digital v2
+      summary: Check-out, liquidación de consumos y liberación de habitación
+      description: |
+        Requiere estado `CHECKED_IN`. Liquida consumos de minibar/servicios, revoca la clave digital y pasa la habitación a limpieza.
+        Emite `alojamiento.checkout.completado` y actualiza stock por gRPC.
+      parameters:
+      - $ref: '#/components/parameters/OrderRefPath'
+      - $ref: '#/components/parameters/CorrelationIdHeader'
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CheckOutRequestV2'
+      responses:
+        '200':
+          description: Check-out completado
+          headers:
+            X-Correlation-ID:
+              $ref: '#/components/headers/X-Correlation-ID'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CheckOutResponseV2'
+        '400':
+          $ref: '#/components/responses/BadRequest400'
+        '401':
+          $ref: '#/components/responses/Unauthorized401'
+        '403':
+          $ref: '#/components/responses/Forbidden403'
+        '404':
+          $ref: '#/components/responses/NotFound404'
+        '409':
+          $ref: '#/components/responses/ConflictState409'
+        '429':
+          $ref: '#/components/responses/TooManyRequests429'
+        '500':
+          $ref: '#/components/responses/InternalError500'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable503'
+      security:
+      - OAuth2ClientCredentials:
+        - alojamientos:checkin
+      - BearerAuth: []
+  /alojamientos/reservations:
+    get:
+      operationId: listMyReservations
+      tags:
+      - Alojamientos - Reservas y Órdenes Saga v2
+      summary: Mis reservas del usuario autenticado
+      description: Devuelve solo las reservas del usuario del JWT (`sub`). Requiere `BearerAuth`.
+      security:
+      - BearerAuth: []
+      x-required-roles:
+      - CLIENTE
+      - ADMIN
+      parameters:
+      - $ref: '#/components/parameters/PageParam'
+      - $ref: '#/components/parameters/LimitParam'
+      - $ref: '#/components/parameters/CorrelationIdHeader'
+      responses:
+        '200':
+          description: Historial del cliente
+          headers:
+            X-Correlation-ID:
+              $ref: '#/components/headers/X-Correlation-ID'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ReservationListResponseV2'
+        '400':
+          $ref: '#/components/responses/BadRequest400'
+        '401':
+          $ref: '#/components/responses/Unauthorized401'
+        '403':
+          $ref: '#/components/responses/Forbidden403'
+        '429':
+          $ref: '#/components/responses/TooManyRequests429'
+        '500':
+          $ref: '#/components/responses/InternalError500'
+  /alojamientos/{id}:
+    get:
+      operationId: getAlojamiento
+      tags:
+      - Alojamientos - Propiedades y Habitaciones v2
+      summary: Ficha técnica de una propiedad
+      security: []
+      parameters:
+      - $ref: '#/components/parameters/AlojamientoIdPath'
+      - $ref: '#/components/parameters/IfNoneMatchHeader'
+      - $ref: '#/components/parameters/CorrelationIdHeader'
+      responses:
+        '200':
+          description: Propiedad
+          headers:
+            X-Correlation-ID:
+              $ref: '#/components/headers/X-Correlation-ID'
+            ETag:
+              $ref: '#/components/headers/ETag'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AlojamientoDetalleV2'
+        '304':
+          $ref: '#/components/responses/NotModified304'
+        '400':
+          $ref: '#/components/responses/BadRequest400'
+        '404':
+          $ref: '#/components/responses/NotFound404'
+        '429':
+          $ref: '#/components/responses/TooManyRequests429'
+        '500':
+          $ref: '#/components/responses/InternalError500'
+  /alojamientos/{id}/habitaciones:
+    get:
+      operationId: listHabitaciones
+      tags:
+      - Alojamientos - Propiedades y Habitaciones v2
+      summary: Tipos de habitación y régimen de una propiedad
+      security: []
+      parameters:
+      - $ref: '#/components/parameters/AlojamientoIdPath'
+      - $ref: '#/components/parameters/IfNoneMatchHeader'
+      - $ref: '#/components/parameters/CorrelationIdHeader'
+      responses:
+        '200':
+          description: Tipos de habitación
+          headers:
+            X-Correlation-ID:
+              $ref: '#/components/headers/X-Correlation-ID'
+            ETag:
+              $ref: '#/components/headers/ETag'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HabitacionesResponseV2'
+        '304':
+          $ref: '#/components/responses/NotModified304'
+        '400':
+          $ref: '#/components/responses/BadRequest400'
+        '404':
+          $ref: '#/components/responses/NotFound404'
+        '429':
+          $ref: '#/components/responses/TooManyRequests429'
+        '500':
+          $ref: '#/components/responses/InternalError500'
+  /alojamientos/{id}/availability:
+    get:
+      operationId: getAvailability
+      tags:
+      - Alojamientos - Disponibilidad y Cotización v2
+      summary: Disponibilidad indicativa por tipo de habitación (sin cotización vinculante)
+      description: |
+        Lista **todos** los tipos de habitación con cupo y precio para el rango (o solo uno si se envía `tipoHabitacion`).
+        Es informativo: no crea `cotizacionId` ni congela precio. Para una oferta vinculante use `POST /alojamientos/availability`.
+      security: []
+      parameters:
+      - $ref: '#/components/parameters/AlojamientoIdPath'
+      - name: checkin
+        in: query
+        required: true
+        schema:
+          type: string
+          format: date
+        example: '2026-11-01'
+        description: Fecha de llegada.
+      - name: checkout
+        in: query
+        required: true
+        schema:
+          type: string
+          format: date
+        example: '2026-11-05'
+        description: Fecha de salida.
+      - name: tipoHabitacion
+        in: query
+        description: Filtra a un solo tipo de habitación.
+        schema:
+          type: string
+          pattern: ^[A-Z0-9_]{2,40}$
+      - name: adults
+        in: query
+        schema:
+          type: integer
+          minimum: 1
+          maximum: 20
+          default: 2
+      - name: children
+        in: query
+        schema:
+          type: integer
+          minimum: 0
+          maximum: 10
+          default: 0
+      - name: rooms
+        in: query
+        schema:
+          type: integer
+          minimum: 1
+          maximum: 10
+          default: 1
+      - $ref: '#/components/parameters/CorrelationIdHeader'
+      responses:
+        '200':
+          description: Opciones disponibles
+          headers:
+            X-Correlation-ID:
+              $ref: '#/components/headers/X-Correlation-ID'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AvailabilityListResponseV2'
+        '400':
+          $ref: '#/components/responses/BadRequest400'
+        '404':
+          $ref: '#/components/responses/NotFound404'
+        '422':
+          $ref: '#/components/responses/Unprocessable422'
+        '429':
+          $ref: '#/components/responses/TooManyRequests429'
+        '500':
+          $ref: '#/components/responses/InternalError500'
+  /alojamientos/{id}/inventario:
+    get:
+      operationId: getInventorySnapshot
+      tags:
+      - Alojamientos - Disponibilidad y Cotización v2
+      summary: Inventario por noche (fuente de verdad para reconciliar el stock gRPC)
+      description: |
+        Devuelve, por noche y tipo de habitación, `habitacionesTotales`, `reservadas`, `bloqueadas` y `disponibles`.
+        Lo usa Booking cuando el `last_sync_hash` del stream gRPC no coincide. Rol `SERVICE`/`ADMIN`. Rango máximo: 92 noches.
+      security:
+      - OAuth2ClientCredentials:
+        - alojamientos:inventory
+      - ApiKeyAuth: []
+      x-required-roles:
+      - SERVICE
+      - ADMIN
+      parameters:
+      - $ref: '#/components/parameters/AlojamientoIdPath'
+      - name: desde
+        in: query
+        required: true
+        schema:
+          type: string
+          format: date
+      - name: hasta
+        in: query
+        required: true
+        schema:
+          type: string
+          format: date
+      - name: tipoHabitacion
+        in: query
+        schema:
+          type: string
+          pattern: ^[A-Z0-9_]{2,40}$
+      - $ref: '#/components/parameters/CorrelationIdHeader'
+      responses:
+        '200':
+          description: Inventario por noche
+          headers:
+            X-Correlation-ID:
+              $ref: '#/components/headers/X-Correlation-ID'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InventarioResponseV2'
+        '400':
+          $ref: '#/components/responses/BadRequest400'
+        '401':
+          $ref: '#/components/responses/Unauthorized401'
+        '403':
+          $ref: '#/components/responses/Forbidden403'
+        '404':
+          $ref: '#/components/responses/NotFound404'
+        '422':
+          $ref: '#/components/responses/Unprocessable422'
+        '429':
+          $ref: '#/components/responses/TooManyRequests429'
+        '500':
+          $ref: '#/components/responses/InternalError500'
+  /alojamientos/{id}/resenas:
+    get:
+      operationId: listResenas
+      tags:
+      - Alojamientos - Reseñas y Calificaciones v2
+      summary: Reseñas de huéspedes con estancia verificada
+      security: []
+      parameters:
+      - $ref: '#/components/parameters/AlojamientoIdPath'
+      - $ref: '#/components/parameters/PageParam'
+      - $ref: '#/components/parameters/LimitParam'
+      - $ref: '#/components/parameters/CorrelationIdHeader'
+      responses:
+        '200':
+          description: Reseñas
+          headers:
+            X-Correlation-ID:
+              $ref: '#/components/headers/X-Correlation-ID'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ListadoResenasResponseV2'
+        '400':
+          $ref: '#/components/responses/BadRequest400'
+        '404':
+          $ref: '#/components/responses/NotFound404'
+        '429':
+          $ref: '#/components/responses/TooManyRequests429'
+        '500':
+          $ref: '#/components/responses/InternalError500'
+    post:
+      operationId: createResena
+      tags:
+      - Alojamientos - Reseñas y Calificaciones v2
+      summary: Publicar reseña (solo titular de una reserva CHECKED_OUT)
+      description: |
+        La reserva DEBE estar `CHECKED_OUT` y pertenecer al usuario. Una reseña por reserva (duplicada → `409 CONFLICT`).
+        Estado distinto de `CHECKED_OUT` → `409 INVALID_STATE_TRANSITION`.
+      security:
+      - BearerAuth: []
+      x-required-roles:
+      - CLIENTE
+      parameters:
+      - $ref: '#/components/parameters/AlojamientoIdPath'
+      - $ref: '#/components/parameters/CorrelationIdHeader'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CrearResenaRequestV2'
+      responses:
+        '201':
+          description: Reseña publicada
+          headers:
+            X-Correlation-ID:
+              $ref: '#/components/headers/X-Correlation-ID'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ResenaUsuarioV2'
+        '400':
+          $ref: '#/components/responses/BadRequest400'
+        '401':
+          $ref: '#/components/responses/Unauthorized401'
+        '403':
+          $ref: '#/components/responses/Forbidden403'
+        '404':
+          $ref: '#/components/responses/NotFound404'
+        '409':
+          $ref: '#/components/responses/ConflictState409'
+        '429':
+          $ref: '#/components/responses/TooManyRequests429'
+        '500':
+          $ref: '#/components/responses/InternalError500'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable503'
+  /alojamientos/tipos:
+    get:
+      operationId: listCategorias_alojamientos_tipos
+      tags:
+      - Alojamientos - Catálogo y Búsqueda v2
+      summary: '[DEPRECADO] Taxonomía de tipos de alojamiento'
+      security: []
+      parameters:
+      - $ref: '#/components/parameters/IfNoneMatchHeader'
+      - $ref: '#/components/parameters/CorrelationIdHeader'
+      responses:
+        '200':
+          description: Categorías
+          headers:
+            X-Correlation-ID:
+              $ref: '#/components/headers/X-Correlation-ID'
+            ETag:
+              $ref: '#/components/headers/ETag'
+          content:
+            application/json:
+              schema:
+                type: array
+                maxItems: 100
+                items:
+                  $ref: '#/components/schemas/CategoriaAlojamientoV2'
+        '304':
+          $ref: '#/components/responses/NotModified304'
+        '400':
+          $ref: '#/components/responses/BadRequest400'
+        '429':
+          $ref: '#/components/responses/TooManyRequests429'
+        '500':
+          $ref: '#/components/responses/InternalError500'
+      deprecated: true
+      x-alias-of: GET /alojamientos/categorias
+      description: '**Alias deprecado** de `GET /alojamientos/categorias` (comportamiento idéntico; se elimina en v3). '
+  /alojamientos/{id}/disponibilidad:
+    get:
+      operationId: getAvailability_alojamientos_id_disponibilidad
+      tags:
+      - Alojamientos - Disponibilidad y Cotización v2
+      summary: '[DEPRECADO] Disponibilidad indicativa por tipo de habitación (sin cotización vinculante)'
+      description: |
+        **Alias deprecado** de `GET /alojamientos/{id}/availability` (comportamiento idéntico; se elimina en v3). Lista **todos** los tipos de habitación con cupo y precio para el rango (o solo uno si se envía `tipoHabitacion`).
+        Es informativo: no crea `cotizacionId` ni congela precio. Para una oferta vinculante use `POST /alojamientos/availability`.
+      security: []
+      parameters:
+      - $ref: '#/components/parameters/AlojamientoIdPath'
+      - name: checkin
+        in: query
+        required: true
+        schema:
+          type: string
+          format: date
+        example: '2026-11-01'
+        description: Fecha de llegada.
+      - name: checkout
+        in: query
+        required: true
+        schema:
+          type: string
+          format: date
+        example: '2026-11-05'
+      - name: tipoHabitacion
+        in: query
+        description: Filtra a un solo tipo de habitación.
+        schema:
+          type: string
+          pattern: ^[A-Z0-9_]{2,40}$
+      - name: adults
+        in: query
+        schema:
+          type: integer
+          minimum: 1
+          maximum: 20
+          default: 2
+      - name: children
+        in: query
+        schema:
+          type: integer
+          minimum: 0
+          maximum: 10
+          default: 0
+      - name: rooms
+        in: query
+        schema:
+          type: integer
+          minimum: 1
+          maximum: 10
+          default: 1
+      - $ref: '#/components/parameters/CorrelationIdHeader'
+      responses:
+        '200':
+          description: Opciones disponibles
+          headers:
+            X-Correlation-ID:
+              $ref: '#/components/headers/X-Correlation-ID'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AvailabilityListResponseV2'
+        '400':
+          $ref: '#/components/responses/BadRequest400'
+        '404':
+          $ref: '#/components/responses/NotFound404'
+        '422':
+          $ref: '#/components/responses/Unprocessable422'
+        '429':
+          $ref: '#/components/responses/TooManyRequests429'
+        '500':
+          $ref: '#/components/responses/InternalError500'
+      deprecated: true
+      x-alias-of: GET /alojamientos/{id}/availability
+  /alojamientos/{id}/reviews:
+    get:
+      operationId: listResenas_alojamientos_id_reviews
+      tags:
+      - Alojamientos - Reseñas y Calificaciones v2
+      summary: '[DEPRECADO] Reseñas de huéspedes con estancia verificada'
+      security: []
+      parameters:
+      - $ref: '#/components/parameters/AlojamientoIdPath'
+      - $ref: '#/components/parameters/PageParam'
+      - $ref: '#/components/parameters/LimitParam'
+      - $ref: '#/components/parameters/CorrelationIdHeader'
+      responses:
+        '200':
+          description: Reseñas
+          headers:
+            X-Correlation-ID:
+              $ref: '#/components/headers/X-Correlation-ID'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ListadoResenasResponseV2'
+        '400':
+          $ref: '#/components/responses/BadRequest400'
+        '404':
+          $ref: '#/components/responses/NotFound404'
+        '429':
+          $ref: '#/components/responses/TooManyRequests429'
+        '500':
+          $ref: '#/components/responses/InternalError500'
+      deprecated: true
+      x-alias-of: GET /alojamientos/{id}/resenas
+      description: '**Alias deprecado** de `GET /alojamientos/{id}/resenas` (comportamiento idéntico; se elimina en v3). '
+    post:
+      operationId: createResena_alojamientos_id_reviews
+      tags:
+      - Alojamientos - Reseñas y Calificaciones v2
+      summary: '[DEPRECADO] Publicar reseña (solo titular de una reserva CHECKED_OUT)'
+      description: |
+        **Alias deprecado** de `POST /alojamientos/{id}/resenas` (comportamiento idéntico; se elimina en v3). La reserva DEBE estar `CHECKED_OUT` y pertenecer al usuario. Una reseña por reserva (duplicada → `409 CONFLICT`).
+        Estado distinto de `CHECKED_OUT` → `409 INVALID_STATE_TRANSITION`.
+      security:
+      - BearerAuth: []
+      x-required-roles:
+      - CLIENTE
+      parameters:
+      - $ref: '#/components/parameters/AlojamientoIdPath'
+      - $ref: '#/components/parameters/CorrelationIdHeader'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CrearResenaRequestV2'
+      responses:
+        '201':
+          description: Reseña publicada
+          headers:
+            X-Correlation-ID:
+              $ref: '#/components/headers/X-Correlation-ID'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ResenaUsuarioV2'
+        '400':
+          $ref: '#/components/responses/BadRequest400'
+        '401':
+          $ref: '#/components/responses/Unauthorized401'
+        '403':
+          $ref: '#/components/responses/Forbidden403'
+        '404':
+          $ref: '#/components/responses/NotFound404'
+        '409':
+          $ref: '#/components/responses/ConflictState409'
+        '429':
+          $ref: '#/components/responses/TooManyRequests429'
+        '500':
+          $ref: '#/components/responses/InternalError500'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable503'
+      deprecated: true
+      x-alias-of: POST /alojamientos/{id}/resenas
+  /alojamientos/reservas:
+    post:
+      operationId: createOrder_alojamientos_reservas
+      tags:
+      - Alojamientos - Reservas y Órdenes Saga v2
+      summary: '[DEPRECADO] Crear reserva (contrato síncrono obligatorio de Saga, ≤ 3000 ms)'
+      description: |-
+        **Alias deprecado** de `POST /alojamientos/orders/create` (comportamiento idéntico; se elimina en v3). Invocado por el ESB en el checkout. **Idempotente** (ver §1.2). Responde `201` con `externalOrderId` o `409 OUT_OF_STOCK`
+        (activa la compensación LIFO). Tabla completa de códigos en §3.
+
+        Validaciones de negocio (→ `422`): fechas y estancia, capacidad de ocupantes, documento del titular (módulo 10),
+        descuento de `paquete` vs acuerdo B2B, y coherencia de `totalPagar` con la cotización (→ `409 PRICE_MISMATCH` / `QUOTE_EXPIRED`).
+
+
+        Valida las **restricciones** del plan (estancia mínima/máxima, cerrado a llegada/salida, stop-sell, cut-off): `422 RESTRICTION_VIOLATED` (ver §4.1). Moneda distinta de USD → `422 UNSUPPORTED_CURRENCY`.
+      x-saga-step: forward
+      x-sla-ms: 3000
+      parameters:
+      - $ref: '#/components/parameters/IdempotencyKeyHeader'
+      - $ref: '#/components/parameters/CorrelationIdHeader'
+      - $ref: '#/components/parameters/NodeIdHeader'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/OrderCreateRequestV2'
+            examples:
+              reservaSimple:
+                summary: Suite Deluxe 4 noches (con cotización congelada)
+                value:
+                  alojamientoId: HTL-QUITO-001
+                  tipoHabitacionCodigo: SUITE_DELUXE
+                  fechaInicio: '2026-11-01'
+                  fechaFin: '2026-11-05'
+                  cantidadHabitaciones: 1
+                  ocupantes:
+                    adultos: 2
+                    ninos: 0
+                  regimenSeleccionado: DESAYUNO_INCLUIDO
+                  cotizacionId: 3f2b8a52-6d3e-4a43-9a0e-1f6d7a9b2c11
+                  totalPagar: '560.00'
+                  currency: USD
+                  payment_method: TARJETA_CREDITO
+                  payment_reference: AUTH-VISA-982341
+                  saga_id: 6ba7b810-9dad-11d1-80b4-00c04fd430c8
+                  huespedTitular:
+                    nombreCompleto: Joselyn Cadena
+                    tipoDocumento: CEDULA
+                    identificacion: '1712345675'
+                    email: jlcadenac@puce.edu.ec
+                    telefono: '+593991234567'
+                    nacionalidad: Ecuatoriana
+                  planTarifaCodigo: FLEX_BB
+              reservaConCombo:
+                summary: Reserva dentro de un paquete con 10 % de descuento
+                value:
+                  alojamientoId: HTL-QUITO-001
+                  tipoHabitacionCodigo: SUITE_DELUXE
+                  fechaInicio: '2026-11-01'
+                  fechaFin: '2026-11-05'
+                  ocupantes:
+                    adultos: 2
+                    ninos: 0
+                  totalPagar: '512.00'
+                  paquete:
+                    paqueteId: 0b5f9d7e-2c11-4f43-8f1a-5d7c3a2e9b10
+                    descuentoPorcentaje: 10.0
+                    descuentoMonto: '48.00'
+                  payment_method: TARJETA_CREDITO
+                  saga_id: 6ba7b810-9dad-11d1-80b4-00c04fd430c8
+                  huespedTitular:
+                    nombreCompleto: Joselyn Cadena
+                    tipoDocumento: CEDULA
+                    identificacion: '1712345675'
+                    email: jlcadenac@puce.edu.ec
+                    telefono: '+593991234567'
+      responses:
+        '201':
+          description: 'Reserva confirmada. Si es un reintento idempotente, la cabecera `Idempotent-Replayed: true` está presente.'
+          headers:
+            X-Correlation-ID:
+              $ref: '#/components/headers/X-Correlation-ID'
+            Location:
+              $ref: '#/components/headers/Location'
+            Idempotent-Replayed:
+              $ref: '#/components/headers/Idempotent-Replayed'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OrderDetailV2'
+        '400':
+          $ref: '#/components/responses/BadRequest400'
+        '401':
+          $ref: '#/components/responses/Unauthorized401'
+        '403':
+          $ref: '#/components/responses/Forbidden403'
+        '404':
+          $ref: '#/components/responses/NotFound404'
+        '409':
+          $ref: '#/components/responses/ConflictOrder409'
+        '422':
+          $ref: '#/components/responses/Unprocessable422'
+        '429':
+          $ref: '#/components/responses/TooManyRequests429'
+        '500':
+          $ref: '#/components/responses/InternalError500'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable503'
+        '504':
+          $ref: '#/components/responses/GatewayTimeout504'
+      security:
+      - OAuth2ClientCredentials:
+        - alojamientos:book
+      - BearerAuth: []
+      - ApiKeyAuth: []
+      deprecated: true
+      x-alias-of: POST /alojamientos/orders/create
+  /alojamientos/{id}/reservations:
+    post:
+      operationId: createOrder_alojamientos_id_reservations
+      tags:
+      - Alojamientos - Reservas y Órdenes Saga v2
+      summary: '[DEPRECADO] Crear reserva (contrato síncrono obligatorio de Saga, ≤ 3000 ms)'
+      description: |-
+        **Alias deprecado** de `POST /alojamientos/orders/create` (comportamiento idéntico; se elimina en v3). Invocado por el ESB en el checkout. **Idempotente** (ver §1.2). Responde `201` con `externalOrderId` o `409 OUT_OF_STOCK`
+        (activa la compensación LIFO). Tabla completa de códigos en §3.
+
+        Validaciones de negocio (→ `422`): fechas y estancia, capacidad de ocupantes, documento del titular (módulo 10),
+        descuento de `paquete` vs acuerdo B2B, y coherencia de `totalPagar` con la cotización (→ `409 PRICE_MISMATCH` / `QUOTE_EXPIRED`).
+
+
+        Valida las **restricciones** del plan (estancia mínima/máxima, cerrado a llegada/salida, stop-sell, cut-off): `422 RESTRICTION_VIOLATED` (ver §4.1). Moneda distinta de USD → `422 UNSUPPORTED_CURRENCY`.
+
+        El `alojamientoId` del cuerpo DEBE coincidir con `{id}` de la ruta (si no, `422 VALIDATION_FAILED`).
+      x-saga-step: forward
+      x-sla-ms: 3000
+      parameters:
+      - $ref: '#/components/parameters/AlojamientoIdPath'
+      - $ref: '#/components/parameters/IdempotencyKeyHeader'
+      - $ref: '#/components/parameters/CorrelationIdHeader'
+      - $ref: '#/components/parameters/NodeIdHeader'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/OrderCreateRequestV2'
+            examples:
+              reservaSimple:
+                summary: Suite Deluxe 4 noches (con cotización congelada)
+                value:
+                  alojamientoId: HTL-QUITO-001
+                  tipoHabitacionCodigo: SUITE_DELUXE
+                  fechaInicio: '2026-11-01'
+                  fechaFin: '2026-11-05'
+                  cantidadHabitaciones: 1
+                  ocupantes:
+                    adultos: 2
+                    ninos: 0
+                  regimenSeleccionado: DESAYUNO_INCLUIDO
+                  cotizacionId: 3f2b8a52-6d3e-4a43-9a0e-1f6d7a9b2c11
+                  totalPagar: '560.00'
+                  currency: USD
+                  payment_method: TARJETA_CREDITO
+                  payment_reference: AUTH-VISA-982341
+                  saga_id: 6ba7b810-9dad-11d1-80b4-00c04fd430c8
+                  huespedTitular:
+                    nombreCompleto: Joselyn Cadena
+                    tipoDocumento: CEDULA
+                    identificacion: '1712345675'
+                    email: jlcadenac@puce.edu.ec
+                    telefono: '+593991234567'
+                    nacionalidad: Ecuatoriana
+                  planTarifaCodigo: FLEX_BB
+              reservaConCombo:
+                summary: Reserva dentro de un paquete con 10 % de descuento
+                value:
+                  alojamientoId: HTL-QUITO-001
+                  tipoHabitacionCodigo: SUITE_DELUXE
+                  fechaInicio: '2026-11-01'
+                  fechaFin: '2026-11-05'
+                  ocupantes:
+                    adultos: 2
+                    ninos: 0
+                  totalPagar: '512.00'
+                  paquete:
+                    paqueteId: 0b5f9d7e-2c11-4f43-8f1a-5d7c3a2e9b10
+                    descuentoPorcentaje: 10.0
+                    descuentoMonto: '48.00'
+                  payment_method: TARJETA_CREDITO
+                  saga_id: 6ba7b810-9dad-11d1-80b4-00c04fd430c8
+                  huespedTitular:
+                    nombreCompleto: Joselyn Cadena
+                    tipoDocumento: CEDULA
+                    identificacion: '1712345675'
+                    email: jlcadenac@puce.edu.ec
+                    telefono: '+593991234567'
+      responses:
+        '201':
+          description: 'Reserva confirmada. Si es un reintento idempotente, la cabecera `Idempotent-Replayed: true` está presente.'
+          headers:
+            X-Correlation-ID:
+              $ref: '#/components/headers/X-Correlation-ID'
+            Location:
+              $ref: '#/components/headers/Location'
+            Idempotent-Replayed:
+              $ref: '#/components/headers/Idempotent-Replayed'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OrderDetailV2'
+        '400':
+          $ref: '#/components/responses/BadRequest400'
+        '401':
+          $ref: '#/components/responses/Unauthorized401'
+        '403':
+          $ref: '#/components/responses/Forbidden403'
+        '404':
+          $ref: '#/components/responses/NotFound404'
+        '409':
+          $ref: '#/components/responses/ConflictOrder409'
+        '422':
+          $ref: '#/components/responses/Unprocessable422'
+        '429':
+          $ref: '#/components/responses/TooManyRequests429'
+        '500':
+          $ref: '#/components/responses/InternalError500'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable503'
+        '504':
+          $ref: '#/components/responses/GatewayTimeout504'
+      security:
+      - OAuth2ClientCredentials:
+        - alojamientos:book
+      - BearerAuth: []
+      - ApiKeyAuth: []
+      deprecated: true
+      x-alias-of: POST /alojamientos/orders/create
+  /alojamientos/reservas/{id}:
+    get:
+      operationId: getOrder_alojamientos_reservas_id
+      tags:
+      - Alojamientos - Reservas y Órdenes Saga v2
+      summary: '[DEPRECADO] Detalle y estado de una reserva'
+      description: '**Alias deprecado** de `GET /alojamientos/orders/{orderId}` (comportamiento idéntico; se elimina en v3).
+        Acepta `orderId` (UUID), `externalOrderId` o `codigoReserva`. Un `CLIENTE` solo ve las suyas (`403` si no).'
+      parameters:
+      - name: id
+        in: path
+        required: true
+        description: Acepta orderId (UUID), externalOrderId (ORD-HTL-…) o codigoReserva (BK-HOTEL-…).
+        schema:
+          $ref: '#/components/schemas/OrderRef'
+      - $ref: '#/components/parameters/CorrelationIdHeader'
+      responses:
+        '200':
+          description: Reserva
+          headers:
+            X-Correlation-ID:
+              $ref: '#/components/headers/X-Correlation-ID'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OrderDetailV2'
+        '400':
+          $ref: '#/components/responses/BadRequest400'
+        '401':
+          $ref: '#/components/responses/Unauthorized401'
+        '403':
+          $ref: '#/components/responses/Forbidden403'
+        '404':
+          $ref: '#/components/responses/NotFound404'
+        '429':
+          $ref: '#/components/responses/TooManyRequests429'
+        '500':
+          $ref: '#/components/responses/InternalError500'
+      security:
+      - OAuth2ClientCredentials:
+        - alojamientos:read
+      - BearerAuth: []
+      - ApiKeyAuth: []
+      deprecated: true
+      x-alias-of: GET /alojamientos/orders/{orderId}
+  /alojamientos/reservations/{reservationId}:
+    get:
+      operationId: getOrder_alojamientos_reservations_reservationId
+      tags:
+      - Alojamientos - Reservas y Órdenes Saga v2
+      summary: '[DEPRECADO] Detalle y estado de una reserva'
+      description: '**Alias deprecado** de `GET /alojamientos/orders/{orderId}` (comportamiento idéntico; se elimina en v3).
+        Acepta `orderId` (UUID), `externalOrderId` o `codigoReserva`. Un `CLIENTE` solo ve las suyas (`403` si no).'
+      parameters:
+      - name: reservationId
+        in: path
+        required: true
+        description: Acepta orderId (UUID), externalOrderId (ORD-HTL-…) o codigoReserva (BK-HOTEL-…).
+        schema:
+          $ref: '#/components/schemas/OrderRef'
+      - $ref: '#/components/parameters/CorrelationIdHeader'
+      responses:
+        '200':
+          description: Reserva
+          headers:
+            X-Correlation-ID:
+              $ref: '#/components/headers/X-Correlation-ID'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OrderDetailV2'
+        '400':
+          $ref: '#/components/responses/BadRequest400'
+        '401':
+          $ref: '#/components/responses/Unauthorized401'
+        '403':
+          $ref: '#/components/responses/Forbidden403'
+        '404':
+          $ref: '#/components/responses/NotFound404'
+        '429':
+          $ref: '#/components/responses/TooManyRequests429'
+        '500':
+          $ref: '#/components/responses/InternalError500'
+      security:
+      - OAuth2ClientCredentials:
+        - alojamientos:read
+      - BearerAuth: []
+      - ApiKeyAuth: []
+      deprecated: true
+      x-alias-of: GET /alojamientos/orders/{orderId}
+  /alojamientos/reservas/{id}/cancel:
+    post:
+      operationId: cancelOrder_alojamientos_reservas_id_cancel
+      tags:
+      - Alojamientos - Reservas y Órdenes Saga v2
+      summary: '[DEPRECADO] Cancelar reserva (acción compensatoria de Saga)'
+      description: |
+        **Alias deprecado** de `POST /alojamientos/orders/{orderId}/cancel` (comportamiento idéntico; se elimina en v3). **Idempotente** y seguro de reintentar: cancelar una reserva ya `CANCELLED` devuelve `200` con `yaCancelada: true`
+        y el **mismo** `codigoReembolso`. Libera la habitación y emite `stock` (gRPC) + evento `alojamiento.reserva.cancelada`.
+
+        * `solicitadoPor = SAGA_ORCHESTRATOR` → reembolso **100 %** siempre.
+        * `solicitadoPor = CLIENTE` → según `politicaCancelacion` (fuera de ventana se aplica `penalidad`).
+        * Estados `CHECKED_IN` / `CHECKED_OUT` → `409 INVALID_STATE_TRANSITION`.
+      x-saga-step: compensation
+      parameters:
+      - name: id
+        in: path
+        required: true
+        description: Acepta orderId (UUID), externalOrderId (ORD-HTL-…) o codigoReserva (BK-HOTEL-…).
+        schema:
+          $ref: '#/components/schemas/OrderRef'
+      - $ref: '#/components/parameters/IdempotencyKeyHeader'
+      - $ref: '#/components/parameters/CorrelationIdHeader'
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CancelOrderRequestV2'
+      responses:
+        '200':
+          description: Cancelada (o ya lo estaba) y cupo restaurado
+          headers:
+            X-Correlation-ID:
+              $ref: '#/components/headers/X-Correlation-ID'
+            Idempotent-Replayed:
+              $ref: '#/components/headers/Idempotent-Replayed'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CancelOrderResponseV2'
+        '400':
+          $ref: '#/components/responses/BadRequest400'
+        '401':
+          $ref: '#/components/responses/Unauthorized401'
+        '403':
+          $ref: '#/components/responses/Forbidden403'
+        '404':
+          $ref: '#/components/responses/NotFound404'
+        '409':
+          $ref: '#/components/responses/ConflictState409'
+        '422':
+          $ref: '#/components/responses/Unprocessable422'
+        '429':
+          $ref: '#/components/responses/TooManyRequests429'
+        '500':
+          $ref: '#/components/responses/InternalError500'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable503'
+        '504':
+          $ref: '#/components/responses/GatewayTimeout504'
+      security:
+      - OAuth2ClientCredentials:
+        - alojamientos:cancel
+      - BearerAuth: []
+      - ApiKeyAuth: []
+      deprecated: true
+      x-alias-of: POST /alojamientos/orders/{orderId}/cancel
+  /alojamientos/reservations/{reservationId}/cancel:
+    post:
+      operationId: cancelOrder_alojamientos_reservations_reservationId_cancel
+      tags:
+      - Alojamientos - Reservas y Órdenes Saga v2
+      summary: '[DEPRECADO] Cancelar reserva (acción compensatoria de Saga)'
+      description: |
+        **Alias deprecado** de `POST /alojamientos/orders/{orderId}/cancel` (comportamiento idéntico; se elimina en v3). **Idempotente** y seguro de reintentar: cancelar una reserva ya `CANCELLED` devuelve `200` con `yaCancelada: true`
+        y el **mismo** `codigoReembolso`. Libera la habitación y emite `stock` (gRPC) + evento `alojamiento.reserva.cancelada`.
+
+        * `solicitadoPor = SAGA_ORCHESTRATOR` → reembolso **100 %** siempre.
+        * `solicitadoPor = CLIENTE` → según `politicaCancelacion` (fuera de ventana se aplica `penalidad`).
+        * Estados `CHECKED_IN` / `CHECKED_OUT` → `409 INVALID_STATE_TRANSITION`.
+      x-saga-step: compensation
+      parameters:
+      - name: reservationId
+        in: path
+        required: true
+        description: Acepta orderId (UUID), externalOrderId (ORD-HTL-…) o codigoReserva (BK-HOTEL-…).
+        schema:
+          $ref: '#/components/schemas/OrderRef'
+      - $ref: '#/components/parameters/IdempotencyKeyHeader'
+      - $ref: '#/components/parameters/CorrelationIdHeader'
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CancelOrderRequestV2'
+      responses:
+        '200':
+          description: Cancelada (o ya lo estaba) y cupo restaurado
+          headers:
+            X-Correlation-ID:
+              $ref: '#/components/headers/X-Correlation-ID'
+            Idempotent-Replayed:
+              $ref: '#/components/headers/Idempotent-Replayed'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CancelOrderResponseV2'
+        '400':
+          $ref: '#/components/responses/BadRequest400'
+        '401':
+          $ref: '#/components/responses/Unauthorized401'
+        '403':
+          $ref: '#/components/responses/Forbidden403'
+        '404':
+          $ref: '#/components/responses/NotFound404'
+        '409':
+          $ref: '#/components/responses/ConflictState409'
+        '422':
+          $ref: '#/components/responses/Unprocessable422'
+        '429':
+          $ref: '#/components/responses/TooManyRequests429'
+        '500':
+          $ref: '#/components/responses/InternalError500'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable503'
+        '504':
+          $ref: '#/components/responses/GatewayTimeout504'
+      security:
+      - OAuth2ClientCredentials:
+        - alojamientos:cancel
+      - BearerAuth: []
+      - ApiKeyAuth: []
+      deprecated: true
+      x-alias-of: POST /alojamientos/orders/{orderId}/cancel
+  /alojamientos/reservas/{id}/checkin:
+    post:
+      operationId: checkInOrder_alojamientos_reservas_id_checkin
+      tags:
+      - Alojamientos - Check-in y Check-out Digital v2
+      summary: '[DEPRECADO] Check-in digital (desde las 14:00 hora de Guayaquil)'
+      description: |
+        **Alias deprecado** de `POST /alojamientos/orders/{orderId}/check-in` (comportamiento idéntico; se elimina en v3). Permitido solo si el instante actual ≥ `checkinFecha` 14:00 (America/Guayaquil) y la reserva está `CONFIRMED`.
+        Antes → `422 CHECKIN_TIME_NOT_REACHED` con `habilitadoDesde`. Excepción: la reserva tiene `earlyCheckinAutorizado = true`
+        (fijado por un ADMIN, nunca por el huésped). Emite `alojamiento.checkin.completado`.
+        Un `CLIENTE` solo puede hacer check-in de **su** reserva (`403 FORBIDDEN` si el token no pertenece al titular). Si el token es correcto pero `titularIdentificacion` del cuerpo no coincide con el titular → `422 INVALID_DOCUMENT`.
+      parameters:
+      - name: id
+        in: path
+        required: true
+        description: Acepta orderId (UUID), externalOrderId (ORD-HTL-…) o codigoReserva (BK-HOTEL-…).
+        schema:
+          $ref: '#/components/schemas/OrderRef'
+      - $ref: '#/components/parameters/CorrelationIdHeader'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CheckInRequestV2'
+      responses:
+        '200':
+          description: Check-in completado, habitación y PIN entregados
+          headers:
+            X-Correlation-ID:
+              $ref: '#/components/headers/X-Correlation-ID'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CheckInResponseV2'
+        '400':
+          $ref: '#/components/responses/BadRequest400'
+        '401':
+          $ref: '#/components/responses/Unauthorized401'
+        '403':
+          $ref: '#/components/responses/Forbidden403'
+        '404':
+          $ref: '#/components/responses/NotFound404'
+        '409':
+          $ref: '#/components/responses/ConflictState409'
+        '422':
+          $ref: '#/components/responses/UnprocessableCheckin422'
+        '429':
+          $ref: '#/components/responses/TooManyRequests429'
+        '500':
+          $ref: '#/components/responses/InternalError500'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable503'
+      security:
+      - OAuth2ClientCredentials:
+        - alojamientos:checkin
+      - BearerAuth: []
+      deprecated: true
+      x-alias-of: POST /alojamientos/orders/{orderId}/check-in
+  /alojamientos/reservations/{reservationId}/checkin:
+    post:
+      operationId: checkInOrder_alojamientos_reservations_reservationId_checkin
+      tags:
+      - Alojamientos - Check-in y Check-out Digital v2
+      summary: '[DEPRECADO] Check-in digital (desde las 14:00 hora de Guayaquil)'
+      description: |
+        **Alias deprecado** de `POST /alojamientos/orders/{orderId}/check-in` (comportamiento idéntico; se elimina en v3). Permitido solo si el instante actual ≥ `checkinFecha` 14:00 (America/Guayaquil) y la reserva está `CONFIRMED`.
+        Antes → `422 CHECKIN_TIME_NOT_REACHED` con `habilitadoDesde`. Excepción: la reserva tiene `earlyCheckinAutorizado = true`
+        (fijado por un ADMIN, nunca por el huésped). Emite `alojamiento.checkin.completado`.
+        Un `CLIENTE` solo puede hacer check-in de **su** reserva (`403 FORBIDDEN` si el token no pertenece al titular). Si el token es correcto pero `titularIdentificacion` del cuerpo no coincide con el titular → `422 INVALID_DOCUMENT`.
+      parameters:
+      - name: reservationId
+        in: path
+        required: true
+        description: Acepta orderId (UUID), externalOrderId (ORD-HTL-…) o codigoReserva (BK-HOTEL-…).
+        schema:
+          $ref: '#/components/schemas/OrderRef'
+      - $ref: '#/components/parameters/CorrelationIdHeader'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CheckInRequestV2'
+      responses:
+        '200':
+          description: Check-in completado, habitación y PIN entregados
+          headers:
+            X-Correlation-ID:
+              $ref: '#/components/headers/X-Correlation-ID'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CheckInResponseV2'
+        '400':
+          $ref: '#/components/responses/BadRequest400'
+        '401':
+          $ref: '#/components/responses/Unauthorized401'
+        '403':
+          $ref: '#/components/responses/Forbidden403'
+        '404':
+          $ref: '#/components/responses/NotFound404'
+        '409':
+          $ref: '#/components/responses/ConflictState409'
+        '422':
+          $ref: '#/components/responses/UnprocessableCheckin422'
+        '429':
+          $ref: '#/components/responses/TooManyRequests429'
+        '500':
+          $ref: '#/components/responses/InternalError500'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable503'
+      security:
+      - OAuth2ClientCredentials:
+        - alojamientos:checkin
+      - BearerAuth: []
+      deprecated: true
+      x-alias-of: POST /alojamientos/orders/{orderId}/check-in
+  /alojamientos/reservas/{id}/checkout:
+    post:
+      operationId: checkOutOrder_alojamientos_reservas_id_checkout
+      tags:
+      - Alojamientos - Check-in y Check-out Digital v2
+      summary: '[DEPRECADO] Check-out, liquidación de consumos y liberación de habitación'
+      description: |
+        **Alias deprecado** de `POST /alojamientos/orders/{orderId}/checkout` (comportamiento idéntico; se elimina en v3). Requiere estado `CHECKED_IN`. Liquida consumos de minibar/servicios, revoca la clave digital y pasa la habitación a limpieza.
+        Emite `alojamiento.checkout.completado` y actualiza stock por gRPC.
+      parameters:
+      - name: id
+        in: path
+        required: true
+        description: Acepta orderId (UUID), externalOrderId (ORD-HTL-…) o codigoReserva (BK-HOTEL-…).
+        schema:
+          $ref: '#/components/schemas/OrderRef'
+      - $ref: '#/components/parameters/CorrelationIdHeader'
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CheckOutRequestV2'
+      responses:
+        '200':
+          description: Check-out completado
+          headers:
+            X-Correlation-ID:
+              $ref: '#/components/headers/X-Correlation-ID'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CheckOutResponseV2'
+        '400':
+          $ref: '#/components/responses/BadRequest400'
+        '401':
+          $ref: '#/components/responses/Unauthorized401'
+        '403':
+          $ref: '#/components/responses/Forbidden403'
+        '404':
+          $ref: '#/components/responses/NotFound404'
+        '409':
+          $ref: '#/components/responses/ConflictState409'
+        '429':
+          $ref: '#/components/responses/TooManyRequests429'
+        '500':
+          $ref: '#/components/responses/InternalError500'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable503'
+      security:
+      - OAuth2ClientCredentials:
+        - alojamientos:checkin
+      - BearerAuth: []
+      deprecated: true
+      x-alias-of: POST /alojamientos/orders/{orderId}/checkout
+  /alojamientos/reservations/{reservationId}/checkout:
+    post:
+      operationId: checkOutOrder_alojamientos_reservations_reservationId_checkout
+      tags:
+      - Alojamientos - Check-in y Check-out Digital v2
+      summary: '[DEPRECADO] Check-out, liquidación de consumos y liberación de habitación'
+      description: |
+        **Alias deprecado** de `POST /alojamientos/orders/{orderId}/checkout` (comportamiento idéntico; se elimina en v3). Requiere estado `CHECKED_IN`. Liquida consumos de minibar/servicios, revoca la clave digital y pasa la habitación a limpieza.
+        Emite `alojamiento.checkout.completado` y actualiza stock por gRPC.
+      parameters:
+      - name: reservationId
+        in: path
+        required: true
+        description: Acepta orderId (UUID), externalOrderId (ORD-HTL-…) o codigoReserva (BK-HOTEL-…).
+        schema:
+          $ref: '#/components/schemas/OrderRef'
+      - $ref: '#/components/parameters/CorrelationIdHeader'
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CheckOutRequestV2'
+      responses:
+        '200':
+          description: Check-out completado
+          headers:
+            X-Correlation-ID:
+              $ref: '#/components/headers/X-Correlation-ID'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CheckOutResponseV2'
+        '400':
+          $ref: '#/components/responses/BadRequest400'
+        '401':
+          $ref: '#/components/responses/Unauthorized401'
+        '403':
+          $ref: '#/components/responses/Forbidden403'
+        '404':
+          $ref: '#/components/responses/NotFound404'
+        '409':
+          $ref: '#/components/responses/ConflictState409'
+        '429':
+          $ref: '#/components/responses/TooManyRequests429'
+        '500':
+          $ref: '#/components/responses/InternalError500'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable503'
+      security:
+      - OAuth2ClientCredentials:
+        - alojamientos:checkin
+      - BearerAuth: []
+      deprecated: true
+      x-alias-of: POST /alojamientos/orders/{orderId}/checkout
+components:
+  securitySchemes:
+    OAuth2ClientCredentials:
+      type: oauth2
+      description: 'Máquina a máquina (ESB ⇄ nodo). Token de corta vida (≤ 15 min) obtenido con `client_credentials`; cada
+        operación exige un scope concreto (principio de mínimo privilegio). **`tokenUrl` es un valor provisional**: confirmar
+        con el servicio de identidad.'
+      flows:
+        clientCredentials:
+          tokenUrl: https://rda1-backend-integracion-sistemas.onrender.com/auth/oauth/token
+          scopes:
+            alojamientos:read: Leer reservas, acuerdo B2B y listados privados.
+            alojamientos:book: Crear reservas (checkout de la Saga).
+            alojamientos:cancel: Cancelar reservas (compensación de la Saga).
+            alojamientos:checkin: Check-in y check-out digital.
+            alojamientos:inventory: Leer inventario por noche y el feed de eventos.
+            alojamientos:admin: Operaciones administrativas (acuerdo B2B, early check-in).
+    BearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: JWT del servicio de identidad. Claims `sub` y `roles` (`CLIENTE`, `ADMIN`, `MANTENIMIENTO`).
+    ApiKeyAuth:
+      type: apiKey
+      in: header
+      name: X-API-Key
+      description: '**DEPRECADO** (se elimina en v3). Llave precompartida heredada para ESB ⇄ nodo (rol `SERVICE`); usar `OAuth2ClientCredentials`.'
+  headers:
+    X-Correlation-ID:
+      description: Identificador de trazabilidad; eco de la petición o generado por el servidor.
+      required: true
+      schema:
+        type: string
+        maxLength: 64
+    Retry-After:
+      description: Segundos que el cliente debe esperar antes de reintentar.
+      schema:
+        type: integer
+        minimum: 0
+    ETag:
+      description: Validador de la representación (para `If-None-Match`).
+      schema:
+        type: string
+        maxLength: 100
+    Location:
+      description: URL canónica de la reserva creada.
+      schema:
+        type: string
+        example: /api/v2/alojamientos/orders/c1a2b3c4-d5e6-7890-1234-567890abcdef
+    Idempotent-Replayed:
+      description: '`true` cuando la respuesta es la repetición de una petición idempotente ya procesada.'
+      schema:
+        type: boolean
+    RateLimit-Limit:
+      schema:
+        type: integer
+    RateLimit-Remaining:
+      schema:
+        type: integer
+    RateLimit-Reset:
+      description: Segundos hasta el reinicio de la ventana.
+      schema:
+        type: integer
+  parameters:
+    CorrelationIdHeader:
+      name: X-Correlation-ID
+      in: header
+      required: false
+      description: Trazabilidad distribuida. El ESB DEBE enviarla; si falta, el servidor genera una.
+      schema:
+        type: string
+        maxLength: 64
+        pattern: ^[A-Za-z0-9._:-]{4,64}$
+      example: 550e8400-e29b-41d4-a716-446655440000
+    NodeIdHeader:
+      name: X-Node-Id
+      in: header
+      required: false
+      description: Nodo emisor (telemetría).
+      schema:
+        type: string
+        maxLength: 64
+    IdempotencyKeyHeader:
+      name: Idempotency-Key
+      in: header
+      required: true
+      description: UUID v4 único por intención de negocio. Ver §1.2 (retención ≥ 24 h, replay, conflicto).
+      schema:
+        type: string
+        format: uuid
+      example: 9b1deb4d-3b7d-4bad-9bdd-2b0d7b3dcb6d
+    IfNoneMatchHeader:
+      name: If-None-Match
+      in: header
+      required: false
+      description: ETag previo; si no cambió → `304 Not Modified`.
+      schema:
+        type: string
+        maxLength: 100
+    PageParam:
+      name: page
+      in: query
+      required: false
+      schema:
+        type: integer
+        minimum: 1
+        default: 1
+    LimitParam:
+      name: limit
+      in: query
+      required: false
+      schema:
+        type: integer
+        minimum: 1
+        maximum: 50
+        default: 10
+    AlojamientoIdPath:
+      name: id
+      in: path
+      required: true
+      description: ID de la propiedad.
+      schema:
+        $ref: '#/components/schemas/AlojamientoId'
+      example: HTL-QUITO-001
+    OrderRefPath:
+      name: orderId
+      in: path
+      required: true
+      description: Acepta `orderId` (UUID), `externalOrderId` (`ORD-HTL-…`) o `codigoReserva` (`BK-HOTEL-…`).
+      schema:
+        $ref: '#/components/schemas/OrderRef'
+      example: ORD-HTL-8842
+  responses:
+    NotModified304:
+      description: La representación no cambió (`If-None-Match`).
+      headers:
+        X-Correlation-ID:
+          $ref: '#/components/headers/X-Correlation-ID'
+        ETag:
+          $ref: '#/components/headers/ETag'
+    BadRequest400:
+      description: Petición malformada o que viola el esquema (campos desconocidos, tipos, formatos).
+      headers:
+        X-Correlation-ID:
+          $ref: '#/components/headers/X-Correlation-ID'
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/ProblemDetails'
+          example:
+            type: https://rda1-backend-integracion-sistemas.onrender.com/errors/validation-failed
+            title: Petición inválida
+            status: 400
+            detail: El cuerpo no cumple el esquema.
+            instance: /api/v2/alojamientos/orders/create
+            code: VALIDATION_FAILED
+            correlation_id: corr-alo-550e8400
+            timestamp: '2026-10-22T11:30:00-05:00'
+            invalid_params:
+            - name: ocupantes
+              reason: Campo obligatorio ausente.
+    Unauthorized401:
+      description: Credencial ausente, inválida o expirada.
+      headers:
+        X-Correlation-ID:
+          $ref: '#/components/headers/X-Correlation-ID'
+        WWW-Authenticate:
+          schema:
+            type: string
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/ProblemDetails'
+          example:
+            type: https://rda1-backend-integracion-sistemas.onrender.com/errors/unauthorized
+            title: No autorizado
+            status: 401
+            detail: Token JWT o X-API-Key ausente o inválido.
+            instance: /api/v2/alojamientos/orders/create
+            code: UNAUTHORIZED
+    Forbidden403:
+      description: Credencial válida pero sin rol o sin propiedad sobre el objeto (p. ej. un CLIENTE accediendo a la reserva
+        de otro).
+      headers:
+        X-Correlation-ID:
+          $ref: '#/components/headers/X-Correlation-ID'
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/ProblemDetails'
+          examples:
+            ajena:
+              value:
+                type: https://rda1-backend-integracion-sistemas.onrender.com/errors/forbidden
+                title: Acceso prohibido
+                status: 403
+                detail: La reserva no pertenece al usuario autenticado.
+                instance: /api/v2/alojamientos/orders/ORD-HTL-8842
+                code: FORBIDDEN
+            scope:
+              value:
+                type: https://rda1-backend-integracion-sistemas.onrender.com/errors/insufficient-scope
+                title: Scope insuficiente
+                status: 403
+                detail: El token no incluye el scope requerido.
+                instance: /api/v2/alojamientos/orders/ORD-HTL-8842/cancel
+                code: INSUFFICIENT_SCOPE
+                scopes_requeridos:
+                - alojamientos:cancel
+    NotFound404:
+      description: Propiedad, habitación o reserva inexistente.
+      headers:
+        X-Correlation-ID:
+          $ref: '#/components/headers/X-Correlation-ID'
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/ProblemDetails'
+          example:
+            type: https://rda1-backend-integracion-sistemas.onrender.com/errors/not-found
+            title: Recurso no encontrado
+            status: 404
+            detail: No existe la reserva ORD-HTL-0000.
+            instance: /api/v2/alojamientos/orders/ORD-HTL-0000
+            code: NOT_FOUND
+    Conflict409:
+      description: Conflicto de negocio (sin cupo, estado inválido, idempotencia, cotización).
+      headers:
+        X-Correlation-ID:
+          $ref: '#/components/headers/X-Correlation-ID'
+        Retry-After:
+          $ref: '#/components/headers/Retry-After'
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/ProblemDetails'
+          example:
+            type: https://rda1-backend-integracion-sistemas.onrender.com/errors/out-of-stock
+            title: Habitación no disponible
+            status: 409
+            detail: No quedan habitaciones SUITE_DELUXE para el rango solicitado.
+            instance: /api/v2/alojamientos/availability
+            code: OUT_OF_STOCK
+    ConflictOrder409:
+      description: |
+        Conflicto en la compra. **`OUT_OF_STOCK` activa la compensación LIFO** del ESB. `QUOTE_EXPIRED` / `PRICE_MISMATCH` piden re-cotizar.
+        `IDEMPOTENCY_IN_PROGRESS` pide reintentar con la misma clave tras `Retry-After`.
+      headers:
+        X-Correlation-ID:
+          $ref: '#/components/headers/X-Correlation-ID'
+        Retry-After:
+          $ref: '#/components/headers/Retry-After'
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/ProblemDetails'
+          examples:
+            outOfStock:
+              summary: Sin stock → dispara Saga
+              value:
+                type: https://rda1-backend-integracion-sistemas.onrender.com/errors/out-of-stock
+                title: Habitación no disponible
+                status: 409
+                detail: Los cupos de Suite Deluxe se agotaron durante la transacción.
+                instance: /api/v2/alojamientos/orders/create
+                code: OUT_OF_STOCK
+                correlation_id: corr-alo-550e8400
+            priceMismatch:
+              summary: El total enviado no coincide con la tarifa vigente
+              value:
+                type: https://rda1-backend-integracion-sistemas.onrender.com/errors/price-mismatch
+                title: Precio distinto al cotizado
+                status: 409
+                detail: totalPagar=500.00 pero la tarifa vigente es 560.00.
+                instance: /api/v2/alojamientos/orders/create
+                code: PRICE_MISMATCH
+            quoteExpired:
+              summary: Cotización vencida
+              value:
+                type: https://rda1-backend-integracion-sistemas.onrender.com/errors/quote-expired
+                title: Cotización vencida
+                status: 409
+                detail: La cotización 3f2b8a52-… venció a las 20:30:00-05:00.
+                instance: /api/v2/alojamientos/orders/create
+                code: QUOTE_EXPIRED
+            inProgress:
+              summary: La primera petición con la misma clave aún se procesa
+              value:
+                type: https://rda1-backend-integracion-sistemas.onrender.com/errors/idempotency-in-progress
+                title: Petición en curso
+                status: 409
+                detail: Reintente con la misma Idempotency-Key.
+                instance: /api/v2/alojamientos/orders/create
+                code: IDEMPOTENCY_IN_PROGRESS
+    ConflictState409:
+      description: La operación no es válida en el estado actual de la reserva.
+      headers:
+        X-Correlation-ID:
+          $ref: '#/components/headers/X-Correlation-ID'
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/ProblemDetails'
+          examples:
+            estado:
+              value:
+                type: https://rda1-backend-integracion-sistemas.onrender.com/errors/invalid-state-transition
+                title: Transición de estado inválida
+                status: 409
+                detail: No se puede cancelar una reserva en estado CHECKED_IN.
+                instance: /api/v2/alojamientos/orders/ORD-HTL-8842/cancel
+                code: INVALID_STATE_TRANSITION
+            reseñaDuplicada:
+              value:
+                type: https://rda1-backend-integracion-sistemas.onrender.com/errors/conflict
+                title: Reseña duplicada
+                status: 409
+                detail: Ya existe una reseña para esta reserva.
+                instance: /api/v2/alojamientos/HTL-QUITO-001/resenas
+                code: CONFLICT
+    Unprocessable422:
+      description: Petición bien formada que viola una regla de negocio.
+      headers:
+        X-Correlation-ID:
+          $ref: '#/components/headers/X-Correlation-ID'
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/ProblemDetails'
+          examples:
+            fechas:
+              value:
+                type: https://rda1-backend-integracion-sistemas.onrender.com/errors/validation-failed
+                title: Error de validación
+                status: 422
+                detail: fechaFin debe ser posterior a fechaInicio.
+                instance: /api/v2/alojamientos/search
+                code: VALIDATION_FAILED
+                invalid_params:
+                - name: fechaFin
+                  reason: Debe ser estrictamente posterior a fechaInicio.
+            documento:
+              value:
+                type: https://rda1-backend-integracion-sistemas.onrender.com/errors/invalid-document
+                title: Documento inválido
+                status: 422
+                detail: La cédula no supera la verificación módulo 10.
+                instance: /api/v2/alojamientos/orders/create
+                code: INVALID_DOCUMENT
+            descuento:
+              value:
+                type: https://rda1-backend-integracion-sistemas.onrender.com/errors/discount-exceeds-contract
+                title: Descuento sobre el máximo pactado
+                status: 422
+                detail: descuentoPorcentaje=20.00 supera porcentaje_descuento_maximo=15.00.
+                instance: /api/v2/alojamientos/orders/create
+                code: DISCOUNT_EXCEEDS_CONTRACT
+            claveReutilizada:
+              value:
+                type: https://rda1-backend-integracion-sistemas.onrender.com/errors/idempotency-key-reused
+                title: Idempotency-Key reutilizada
+                status: 422
+                detail: La clave ya se usó con un cuerpo distinto. Genere una nueva para una nueva intención.
+                instance: /api/v2/alojamientos/orders/create
+                code: IDEMPOTENCY_KEY_REUSED
+            promocionesNoPermitidas:
+              value:
+                type: https://rda1-backend-integracion-sistemas.onrender.com/errors/promotions-not-allowed
+                title: El nodo no acepta promociones
+                status: 422
+                detail: permite_promociones=false en el acuerdo B2B vigente.
+                instance: /api/v2/alojamientos/orders/create
+                code: PROMOTIONS_NOT_ALLOWED
+            capacidad:
+              value:
+                type: https://rda1-backend-integracion-sistemas.onrender.com/errors/capacity-exceeded
+                title: Capacidad excedida
+                status: 422
+                detail: SUITE_DELUXE admite 2 adultos y 1 niño por habitación.
+                instance: /api/v2/alojamientos/orders/create
+                code: CAPACITY_EXCEEDED
+            restriccion:
+              value:
+                type: https://rda1-backend-integracion-sistemas.onrender.com/errors/restriction-violated
+                title: Restricción de tarifa
+                status: 422
+                detail: La tarifa FLEX_BB exige estancia mínima de 3 noches el 2026-12-24.
+                instance: /api/v2/alojamientos/availability
+                code: RESTRICTION_VIOLATED
+                restriccion: MIN_STAY
+            monedaNoSoportada:
+              value:
+                type: https://rda1-backend-integracion-sistemas.onrender.com/errors/unsupported-currency
+                title: Moneda no soportada
+                status: 422
+                detail: Este nodo opera solo en USD.
+                instance: /api/v2/alojamientos/orders/create
+                code: UNSUPPORTED_CURRENCY
+    UnprocessableCheckin422:
+      description: Regla horaria o de negocio del check-in.
+      headers:
+        X-Correlation-ID:
+          $ref: '#/components/headers/X-Correlation-ID'
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/ProblemDetails'
+          examples:
+            muyTemprano:
+              summary: Antes de las 14:00 (America/Guayaquil)
+              value:
+                type: https://rda1-backend-integracion-sistemas.onrender.com/errors/checkin-time-not-reached
+                title: Check-in digital no disponible
+                status: 422
+                detail: El check-in digital se habilita a partir de las 14:00 (hora de Guayaquil) del día de llegada.
+                instance: /api/v2/alojamientos/orders/ORD-HTL-8842/check-in
+                code: CHECKIN_TIME_NOT_REACHED
+                habilitadoDesde: '2026-11-01T14:00:00-05:00'
+            documento:
+              value:
+                type: https://rda1-backend-integracion-sistemas.onrender.com/errors/invalid-document
+                title: Identificación no coincide
+                status: 422
+                detail: titularIdentificacion no corresponde al titular de la reserva.
+                instance: /api/v2/alojamientos/orders/ORD-HTL-8842/check-in
+                code: INVALID_DOCUMENT
+    TooManyRequests429:
+      description: Se excedió el límite de peticiones.
+      headers:
+        X-Correlation-ID:
+          $ref: '#/components/headers/X-Correlation-ID'
+        Retry-After:
+          $ref: '#/components/headers/Retry-After'
+        RateLimit-Limit:
+          $ref: '#/components/headers/RateLimit-Limit'
+        RateLimit-Remaining:
+          $ref: '#/components/headers/RateLimit-Remaining'
+        RateLimit-Reset:
+          $ref: '#/components/headers/RateLimit-Reset'
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/ProblemDetails'
+          example:
+            type: https://rda1-backend-integracion-sistemas.onrender.com/errors/rate-limited
+            title: Demasiadas peticiones
+            status: 429
+            detail: Reintente en 5 segundos.
+            instance: /api/v2/alojamientos
+            code: RATE_LIMITED
+            retry_after_seconds: 5
+    InternalError500:
+      description: Error interno del nodo.
+      headers:
+        X-Correlation-ID:
+          $ref: '#/components/headers/X-Correlation-ID'
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/ProblemDetails'
+          example:
+            type: https://rda1-backend-integracion-sistemas.onrender.com/errors/internal-error
+            title: Error interno
+            status: 500
+            detail: Error no controlado. Cite el correlation_id al reportarlo.
+            instance: /api/v2/alojamientos/orders/create
+            code: INTERNAL_ERROR
+            correlation_id: corr-alo-550e8400
+    ServiceUnavailable503:
+      description: Nodo deshabilitado por kill-switch, circuito abierto o en mantenimiento. Reintente con la misma `Idempotency-Key`.
+      headers:
+        X-Correlation-ID:
+          $ref: '#/components/headers/X-Correlation-ID'
+        Retry-After:
+          $ref: '#/components/headers/Retry-After'
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/ProblemDetails'
+          example:
+            type: https://rda1-backend-integracion-sistemas.onrender.com/errors/provider-disabled
+            title: Proveedor no disponible
+            status: 503
+            detail: El nodo de alojamientos está deshabilitado temporalmente.
+            instance: /api/v2/alojamientos/orders/create
+            code: PROVIDER_DISABLED
+            retry_after_seconds: 30
+    GatewayTimeout504:
+      description: Una dependencia interna del nodo excedió su tiempo. **El resultado de la operación es desconocido**; consulte
+        `GET /alojamientos/orders?saga_id=…` antes de compensar.
+      headers:
+        X-Correlation-ID:
+          $ref: '#/components/headers/X-Correlation-ID'
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/ProblemDetails'
+          example:
+            type: https://rda1-backend-integracion-sistemas.onrender.com/errors/gateway-timeout
+            title: Tiempo de espera agotado
+            status: 504
+            detail: La base de datos no respondió a tiempo.
+            instance: /api/v2/alojamientos/orders/create
+            code: GATEWAY_TIMEOUT
+  schemas:
+    ErrorCode:
+      type: string
+      description: |
+        Catálogo cerrado de códigos de error (compartido por las 4 verticales).
+        **Deprecados (solo lectura, ya no se emiten):** `ROOM_NO_LONGER_AVAILABLE` → usar `OUT_OF_STOCK`; `HOTEL_NOT_FOUND` → usar `NOT_FOUND`.
+      enum:
+      - VALIDATION_FAILED
+      - INVALID_DOCUMENT
+      - UNAUTHORIZED
+      - FORBIDDEN
+      - NOT_FOUND
+      - HOTEL_NOT_FOUND
+      - CONFLICT
+      - OUT_OF_STOCK
+      - ROOM_NO_LONGER_AVAILABLE
+      - QUOTE_EXPIRED
+      - PRICE_MISMATCH
+      - IDEMPOTENCY_KEY_REUSED
+      - IDEMPOTENCY_IN_PROGRESS
+      - INVALID_STATE_TRANSITION
+      - CHECKIN_TIME_NOT_REACHED
+      - CAPACITY_EXCEEDED
+      - DISCOUNT_EXCEEDS_CONTRACT
+      - PROMOTIONS_NOT_ALLOWED
+      - RATE_LIMITED
+      - PROVIDER_DISABLED
+      - GATEWAY_TIMEOUT
+      - INTERNAL_ERROR
+      - RESTRICTION_VIOLATED
+      - UNSUPPORTED_CURRENCY
+      - INSUFFICIENT_SCOPE
+    ProblemDetails:
+      type: object
+      required:
+      - type
+      - title
+      - status
+      - detail
+      - instance
+      - code
+      properties:
+        type:
+          type: string
+          format: uri
+          maxLength: 200
+        title:
+          type: string
+          maxLength: 120
+        status:
+          type: integer
+          minimum: 400
+          maximum: 599
+        detail:
+          type: string
+          maxLength: 500
+        instance:
+          type: string
+          maxLength: 300
+        code:
+          $ref: '#/components/schemas/ErrorCode'
+        correlation_id:
+          type: string
+          maxLength: 64
+        timestamp:
+          type: string
+          format: date-time
+        retry_after_seconds:
+          type: integer
+          minimum: 0
+        habilitadoDesde:
+          type: string
+          format: date-time
+          description: Solo en `CHECKIN_TIME_NOT_REACHED`. Instante (con offset) desde el cual se permite el check-in.
+        invalid_params:
+          type: array
+          maxItems: 50
+          items:
+            type: object
+            required:
+            - name
+            - reason
+            properties:
+              name:
+                type: string
+                maxLength: 100
+              reason:
+                type: string
+                maxLength: 300
+        restriccion:
+          type: string
+          enum:
+          - MIN_STAY
+          - MAX_STAY
+          - CLOSED_TO_ARRIVAL
+          - CLOSED_TO_DEPARTURE
+          - STOP_SELL
+          - CUTOFF
+          description: 'Solo en `RESTRICTION_VIOLATED`: qué restricción se violó.'
+        scopes_requeridos:
+          type: array
+          maxItems: 10
+          items:
+            type: string
+            maxLength: 60
+          description: Solo en `INSUFFICIENT_SCOPE`.
+    PaginationMetadata:
+      type: object
+      required:
+      - total_results
+      - page
+      - limit
+      - total_pages
+      - has_next
+      properties:
+        total_results:
+          type: integer
+          minimum: 0
+          example: 18
+        page:
+          type: integer
+          minimum: 1
+          example: 1
+        limit:
+          type: integer
+          minimum: 1
+          maximum: 50
+          example: 10
+        total_pages:
+          type: integer
+          minimum: 0
+          example: 2
+        has_next:
+          type: boolean
+          example: true
+    HateoasLinksV2:
+      type: object
+      description: Enlaces HATEOAS (nivel 3). Las claves son relaciones (`self`, `cancel`, `checkin`, `checkout`, …).
+      additionalProperties:
+        type: object
+        required:
+        - href
+        - method
+        properties:
+          href:
+            type: string
+            maxLength: 300
+          method:
+            type: string
+            enum:
+            - GET
+            - POST
+            - PUT
+            - DELETE
+          description:
+            type: string
+            maxLength: 200
+    AlojamientoId:
+      type: string
+      description: 'ID de propiedad. Las palabras reservadas de rutas estáticas (`health`, `eventos`, `categorias`, `tipos`,
+        `orders`, `reservations`, `reservas`, `search`, `availability`, `promociones`) NO son IDs válidos: evita que `GET
+        /alojamientos/{id}` capture rutas estáticas.'
+      pattern: ^(?!(health|eventos|categorias|tipos|orders|reservations|reservas|search|availability|promociones)$)[A-Za-z0-9][A-Za-z0-9._-]{2,63}$
+      maxLength: 64
+      example: HTL-QUITO-001
+    OrderRef:
+      type: string
+      description: UUID (`orderId`), `externalOrderId` (`ORD-HTL-…`) o `codigoReserva` (`BK-HOTEL-…`).
+      pattern: ^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}|ORD-HTL-[A-Z0-9]{3,20}|BK-HOTEL-[A-Z0-9]{3,20})$
+      example: ORD-HTL-8842
+    ReservationStatus:
+      type: string
+      enum:
+      - PENDING
+      - CONFIRMED
+      - CANCELLED
+      - CHECKED_IN
+      - CHECKED_OUT
+    RegimenHospedajeEnum:
+      type: string
+      enum:
+      - SOLO_HABITACION
+      - DESAYUNO_INCLUIDO
+      - MEDIA_PENSION
+      - PENSION_COMPLETA
+      - TODO_INCLUIDO
+    PaymentMethod:
+      type: string
+      description: Vocabulario único de las 4 verticales y de MS_PAG.
+      enum:
+      - TARJETA_CREDITO
+      - TARJETA_DEBITO
+      - TRANSFERENCIA
+      - SIMULADO
+      - PAGO_EN_SITIO
+    Ocupantes:
+      type: object
+      required:
+      - adultos
+      properties:
+        adultos:
+          type: integer
+          minimum: 1
+          maximum: 20
+          example: 2
+        ninos:
+          type: integer
+          minimum: 0
+          maximum: 10
+          default: 0
+          example: 0
+        edadesNinos:
+          type: array
+          maxItems: 10
+          items:
+            type: integer
+            minimum: 0
+            maximum: 17
+    TelefonoE164OLocal:
+      type: string
+      pattern: ^(\+[0-9]{8,15}|09[0-9]{8})$
+      example: '+593991234567'
+    AlojamientosHealthResponseV2:
+      type: object
+      required:
+      - status
+      - semaforo
+      - service
+      - latency_ms
+      - timestamp
+      properties:
+        status:
+          type: string
+          enum:
+          - HEALTHY
+          - DEGRADED
+          - DOWN
+          description: Equivale a `UP`/`DEGRADED`/`DOWN` de otros nodos (UP ≡ HEALTHY).
+          example: HEALTHY
+        semaforo:
+          type: string
+          enum:
+          - GREEN
+          - YELLOW
+          - RED
+          example: GREEN
+        service:
+          type: string
+          maxLength: 50
+          example: MS_ALOJAMIENTOS
+        version:
+          type: string
+          maxLength: 20
+          example: 2.1.0
+        latency_ms:
+          type: integer
+          minimum: 0
+          example: 38
+        uptime_seconds:
+          type: integer
+          minimum: 0
+          example: 86400
+        database:
+          type: object
+          properties:
+            status:
+              type: string
+              enum:
+              - CONNECTED
+              - DISCONNECTED
+              example: CONNECTED
+        circuit_breaker:
+          type: string
+          enum:
+          - CLOSED
+          - OPEN
+          - HALF_OPEN
+          - MANUALLY_OPEN
+          example: CLOSED
+        metrics:
+          type: object
+          properties:
+            total_propiedades:
+              type: integer
+              minimum: 0
+              example: 45
+            habitaciones_totales:
+              type: integer
+              minimum: 0
+              example: 320
+            habitaciones_ocupadas:
+              type: integer
+              minimum: 0
+              example: 210
+            tasa_ocupacion_pct:
+              type: number
+              minimum: 0
+              maximum: 100
+              example: 65.62
+        timestamp:
+          type: string
+          format: date-time
+          example: '2026-10-22T20:00:00-05:00'
+    ContratoPromocionesResponseV2:
+      type: object
+      required:
+      - tienda_id
+      - vertical
+      - permite_promociones
+      - porcentaje_descuento_maximo
+      properties:
+        tienda_id:
+          type: string
+          maxLength: 60
+          example: proveedor-alojamientos-lizz
+        vertical:
+          type: string
+          enum:
+          - alojamientos
+          example: alojamientos
+        permite_promociones:
+          type: boolean
+          example: true
+        porcentaje_descuento_maximo:
+          type: number
+          minimum: 0
+          maximum: 50
+          example: 15.0
+        destinos_habilitados:
+          type: array
+          maxItems: 50
+          items:
+            type: string
+            maxLength: 80
+          example:
+          - Quito
+          - Galápagos
+          - Cuenca
+          - Baños
+        vigencia_desde:
+          type: string
+          format: date
+          example: '2026-10-01'
+        vigencia_hasta:
+          type: string
+          format: date
+          example: '2027-12-31'
+        condiciones_combo:
+          type: string
+          maxLength: 500
+          example: Válido para estancias mínimas de 2 noches combinadas con vuelos o tours.
+        contacto_comercial:
+          type: object
+          properties:
+            nombre:
+              type: string
+              maxLength: 100
+            email:
+              type: string
+              format: email
+              maxLength: 120
+            telefono:
+              $ref: '#/components/schemas/TelefonoE164OLocal'
+          x-pii: true
+        updated_at:
+          type: string
+          format: date-time
+          example: '2026-10-22T10:00:00-05:00'
+    ContratoPromocionesRequestV2:
+      type: object
+      additionalProperties: false
+      required:
+      - permite_promociones
+      - porcentaje_descuento_maximo
+      properties:
+        permite_promociones:
+          type: boolean
+          example: true
+        porcentaje_descuento_maximo:
+          type: number
+          minimum: 0
+          maximum: 50
+          example: 15.0
+          description: 0 si `permite_promociones` es false.
+        destinos_habilitados:
+          type: array
+          maxItems: 50
+          items:
+            type: string
+            maxLength: 80
+        vigencia_hasta:
+          type: string
+          format: date
+          description: Debe ser ≥ hoy (Guayaquil).
+        condiciones_combo:
+          type: string
+          maxLength: 500
+        contacto_comercial:
+          type: object
+          properties:
+            nombre:
+              type: string
+              maxLength: 100
+            email:
+              type: string
+              format: email
+              maxLength: 120
+            telefono:
+              $ref: '#/components/schemas/TelefonoE164OLocal'
+          x-pii: true
+    PaqueteAplicadoV2:
+      type: object
+      additionalProperties: false
+      required:
+      - paqueteId
+      - descuentoPorcentaje
+      - descuentoMonto
+      description: Descuento de combo aplicado por el ESB (ORQ_PKG). Se valida contra el acuerdo B2B.
+      properties:
+        paqueteId:
+          type: string
+          format: uuid
+        descuentoPorcentaje:
+          type: number
+          minimum: 0
+          maximum: 50
+          example: 10.0
+        descuentoMonto:
+          allOf:
+          - $ref: '#/components/schemas/Money'
+          example: '48.00'
+          description: DEBE ser igual a `round_half_up(subtotal × descuentoPorcentaje / 100)`; si no → `422 VALIDATION_FAILED`.
+    EventType:
+      type: string
+      enum:
+      - alojamiento.reserva.confirmada
+      - alojamiento.reserva.cancelada
+      - alojamiento.checkin.completado
+      - alojamiento.checkout.completado
+      - alojamiento.stock.actualizado
+    AlojamientosEventosResponseV2:
+      type: object
+      required:
+      - eventos
+      - has_more
+      - next_after
+      properties:
+        eventos:
+          type: array
+          maxItems: 200
+          items:
+            $ref: '#/components/schemas/CloudEventV2'
+        has_more:
+          type: boolean
+        next_after:
+          type: integer
+          format: int64
+          description: Valor a enviar en `after` en la siguiente llamada.
+          example: 1045
+          maximum: 9223372036854775807
+          minimum: 0
+    CloudEventV2:
+      type: object
+      required:
+      - id
+      - source
+      - specversion
+      - type
+      - time
+      - sequence
+      - subject
+      - datacontenttype
+      - data
+      properties:
+        id:
+          type: string
+          maxLength: 64
+          example: evt-alo-2026-001043
+        source:
+          type: string
+          example: /services/alojamientos
+          maxLength: 200
+        specversion:
+          type: string
+          enum:
+          - '1.0'
+        type:
+          $ref: '#/components/schemas/EventType'
+        time:
+          type: string
+          format: date-time
+          example: '2026-10-22T19:30:00-05:00'
+        sequence:
+          type: integer
+          format: int64
+          minimum: 1
+          description: Orden total del feed (sin saltos).
+          example: 1043
+          maximum: 9223372036854775807
+        subject:
+          type: string
+          description: '`orderId` o `<alojamientoId>:<tipoHabitacion>` según el evento.'
+          example: ORD-HTL-8842
+          maxLength: 200
+        correlationid:
+          type: string
+          maxLength: 64
+          description: Extensión CloudEvents de trazabilidad (= X-Correlation-ID de la operación origen).
+        datacontenttype:
+          type: string
+          enum:
+          - application/json
+        data:
+          oneOf:
+          - $ref: '#/components/schemas/EventDataReservaV2'
+          - $ref: '#/components/schemas/EventDataStockV2'
+    EventDataReservaV2:
+      type: object
+      required:
+      - orderId
+      - external_order_id
+      - estado
+      properties:
+        orderId:
+          type: string
+          format: uuid
+        external_order_id:
+          type: string
+          example: ORD-HTL-8842
+          maxLength: 200
+        saga_id:
+          type: string
+          maxLength: 200
+        estado:
+          $ref: '#/components/schemas/ReservationStatus'
+        alojamientoId:
+          type: string
+          maxLength: 200
+        total:
+          $ref: '#/components/schemas/Money'
+    EventDataStockV2:
+      type: object
+      required:
+      - alojamientoId
+      - tipoHabitacionCodigo
+      - fecha
+      - unidadesDisponibles
+      properties:
+        alojamientoId:
+          type: string
+          maxLength: 200
+        tipoHabitacionCodigo:
+          type: string
+          maxLength: 200
+        fecha:
+          type: string
+          format: date
+        unidadesDisponibles:
+          type: integer
+          minimum: 0
+    SearchAccommodationRequestV2:
+      type: object
+      additionalProperties: false
+      required:
+      - destino
+      - fechaInicio
+      - fechaFin
+      - adultos
+      properties:
+        destino:
+          type: string
+          minLength: 2
+          maxLength: 80
+          example: Quito
+        fechaInicio:
+          type: string
+          format: date
+          description: Check-in. ≥ hoy (Guayaquil).
+          example: '2026-11-01'
+        fechaFin:
+          type: string
+          format: date
+          description: Check-out. Estrictamente posterior; estancia ≤ 30 noches.
+          example: '2026-11-05'
+        adultos:
+          type: integer
+          minimum: 1
+          maximum: 20
+          example: 2
+        ninos:
+          type: integer
+          minimum: 0
+          maximum: 10
+          default: 0
+          example: 1
+        edadesNinos:
+          type: array
+          maxItems: 10
+          items:
+            type: integer
+            minimum: 0
+            maximum: 17
+        habitaciones:
+          type: integer
+          minimum: 1
+          maximum: 10
+          default: 1
+        estrellasMinimas:
+          type: integer
+          minimum: 1
+          maximum: 5
+        precioMaximo:
+          $ref: '#/components/schemas/Money'
+        amenidadesDeseadas:
+          type: array
+          maxItems: 20
+          items:
+            type: string
+            maxLength: 60
+        regimen:
+          $ref: '#/components/schemas/RegimenHospedajeEnum'
+        permitePaquete:
+          type: boolean
+          description: Solo propiedades que aceptan combos.
+        currency:
+          $ref: '#/components/schemas/CurrencyCode'
+    SearchAccommodationResponseV2:
+      type: object
+      required:
+      - request_id
+      - metadata
+      - data
+      properties:
+        request_id:
+          type: string
+          maxLength: 64
+          example: req-alo-179200
+        metadata:
+          allOf:
+          - $ref: '#/components/schemas/PaginationMetadata'
+          - type: object
+            properties:
+              destino:
+                type: string
+                example: Quito
+                maxLength: 200
+              noches:
+                type: integer
+                minimum: 1
+                maximum: 30
+                example: 4
+        data:
+          type: array
+          maxItems: 50
+          items:
+            $ref: '#/components/schemas/AlojamientoCardV2'
+        alojamientos:
+          type: array
+          deprecated: true
+          description: Alias de `data` (se elimina en v3).
+          maxItems: 50
+          items:
+            $ref: '#/components/schemas/AlojamientoCardV2'
+        _links:
+          $ref: '#/components/schemas/HateoasLinksV2'
+    AlojamientoListResponseV2:
+      type: object
+      required:
+      - metadata
+      - data
+      properties:
+        metadata:
+          $ref: '#/components/schemas/PaginationMetadata'
+        data:
+          type: array
+          maxItems: 50
+          items:
+            $ref: '#/components/schemas/AlojamientoCardV2'
+        total:
+          type: integer
+          deprecated: true
+          description: Alias de `metadata.total_results`.
+          minimum: 0
+        page:
+          type: integer
+          deprecated: true
+          description: Alias de `metadata.page` (se elimina en v3).
+          minimum: 1
+        limit:
+          type: integer
+          deprecated: true
+          description: Alias de `metadata.limit` (se elimina en v3).
+          minimum: 1
+        _links:
+          $ref: '#/components/schemas/HateoasLinksV2'
+    AlojamientoCardV2:
+      type: object
+      required:
+      - id
+      - nombre
+      - destino
+      - estrellas
+      - precioPorNoche
+      - moneda
+      - permitePaquete
+      properties:
+        id:
+          type: string
+          example: HTL-QUITO-001
+          maxLength: 200
+        nombre:
+          type: string
+          maxLength: 150
+          example: Hotel Plaza Grande
+        tipoPropiedad:
+          type: string
+          enum:
+          - HOTEL
+          - RESORT
+          - APARTAMENTO
+          - HOSTAL
+          - HOSTERIA
+          example: HOTEL
+        destino:
+          type: string
+          maxLength: 80
+          example: Quito
+        direccion:
+          type: string
+          maxLength: 200
+        estrellas:
+          type: integer
+          minimum: 1
+          maximum: 5
+          example: 5
+        scoreCalificacion:
+          type: number
+          minimum: 0
+          maximum: 10
+          example: 9.4
+        totalResenas:
+          type: integer
+          minimum: 0
+          example: 342
+        precioPorNoche:
+          allOf:
+          - $ref: '#/components/schemas/Money'
+          example: '120.00'
+        precioTotalEstancia:
+          allOf:
+          - $ref: '#/components/schemas/Money'
+          description: Solo cuando la consulta incluye fechas.
+          example: '480.00'
+        moneda:
+          $ref: '#/components/schemas/CurrencyCode'
+        permitePaquete:
+          type: boolean
+          example: true
+        descuentoMaximo:
+          type: number
+          minimum: 0
+          maximum: 50
+          example: 15.0
+        checkInPermitidoDesde:
+          type: string
+          pattern: ^([01][0-9]|2[0-3]):[0-5][0-9]$
+          example: '14:00'
+        checkOutHoraMaxima:
+          type: string
+          pattern: ^([01][0-9]|2[0-3]):[0-5][0-9]$
+          example: '11:00'
+        fotos:
+          type: array
+          maxItems: 20
+          items:
+            type: string
+            format: uri
+        amenidades:
+          type: array
+          maxItems: 60
+          items:
+            type: string
+            maxLength: 60
+        actualizadoEn:
+          type: string
+          format: date-time
+          example: '2026-10-22T09:00:00-05:00'
+    DesgloseCalificacionesV2:
+      type: object
+      properties:
+        limpieza:
+          type: number
+          minimum: 0
+          maximum: 10
+          example: 9.8
+        confort:
+          type: number
+          minimum: 0
+          maximum: 10
+          example: 9.5
+        ubicacion:
+          type: number
+          minimum: 0
+          maximum: 10
+          example: 9.9
+        personal:
+          type: number
+          minimum: 0
+          maximum: 10
+          example: 9.6
+        relacionCalidadPrecio:
+          type: number
+          minimum: 0
+          maximum: 10
+          example: 9.1
+    PoliticaCancelacionV2:
+      type: object
+      required:
+      - esReembolsable
+      properties:
+        esReembolsable:
+          type: boolean
+          example: true
+        horasLimiteCancelacion:
+          type: integer
+          minimum: 0
+          maximum: 720
+          example: 48
+          description: Horas antes de las 14:00 del check-in con reembolso del 100 %.
+        penalidadFueraDeVentanaPorcentaje:
+          type: number
+          minimum: 0
+          maximum: 100
+          example: 100
+          description: '% retenido si el CLIENTE cancela fuera de la ventana. No aplica a compensación de Saga.'
+        descripcion:
+          type: string
+          maxLength: 300
+          example: Cancelación gratuita hasta 48 horas antes de las 14:00 del día de llegada.
+    AlojamientoDetalleV2:
+      type: object
+      required:
+      - id
+      - nombre
+      - destino
+      - estrellas
+      properties:
+        id:
+          type: string
+          example: HTL-QUITO-001
+          maxLength: 200
+        nombre:
+          type: string
+          maxLength: 150
+        tipoPropiedad:
+          type: string
+          example: HOTEL
+          maxLength: 200
+        descripcion:
+          type: string
+          maxLength: 2000
+        destino:
+          type: string
+          maxLength: 80
+        direccion:
+          type: string
+          maxLength: 200
+        coordenadasGps:
+          type: object
+          properties:
+            latitud:
+              type: number
+              minimum: -90
+              maximum: 90
+              example: -0.2201
+            longitud:
+              type: number
+              minimum: -180
+              maximum: 180
+              example: -78.5123
+        zonaHoraria:
+          type: string
+          enum:
+          - America/Guayaquil
+          - Pacific/Galapagos
+          example: America/Guayaquil
+          description: Zona usada para las reglas de 14:00 / check-out. Galápagos es UTC-6.
+        estrellas:
+          type: integer
+          minimum: 1
+          maximum: 5
+        scoreCalificacion:
+          type: number
+          minimum: 0
+          maximum: 10
+        desgloseCalificaciones:
+          $ref: '#/components/schemas/DesgloseCalificacionesV2'
+        politicaCancelacion:
+          $ref: '#/components/schemas/PoliticaCancelacionV2'
+        checkInPermitidoDesde:
+          type: string
+          pattern: ^([01][0-9]|2[0-3]):[0-5][0-9]$
+          example: '14:00'
+        checkOutHoraMaxima:
+          type: string
+          pattern: ^([01][0-9]|2[0-3]):[0-5][0-9]$
+          example: '11:00'
+        amenidades:
+          type: array
+          maxItems: 60
+          items:
+            type: string
+            maxLength: 60
+        galeriaFotos:
+          type: array
+          maxItems: 50
+          items:
+            type: string
+            format: uri
+        permitePaquete:
+          type: boolean
+        descuentoMaximo:
+          type: number
+          minimum: 0
+          maximum: 50
+        proveedor:
+          type: object
+          properties:
+            id:
+              type: string
+              example: proveedor-alojamientos-lizz
+              maxLength: 200
+            nombre:
+              type: string
+              maxLength: 120
+        actualizadoEn:
+          type: string
+          format: date-time
+        _links:
+          $ref: '#/components/schemas/HateoasLinksV2'
+    TipoHabitacionV2:
+      type: object
+      required:
+      - codigo
+      - nombre
+      - capacidadAdultos
+      - precioBaseNoche
+      properties:
+        codigo:
+          type: string
+          pattern: ^[A-Z0-9_]{2,40}$
+          example: SUITE_DELUXE
+        nombre:
+          type: string
+          maxLength: 100
+          example: Suite Deluxe Matrimonial
+        descripcion:
+          type: string
+          maxLength: 1000
+        capacidadAdultos:
+          type: integer
+          minimum: 1
+          maximum: 20
+          example: 2
+        capacidadNinos:
+          type: integer
+          minimum: 0
+          maximum: 10
+          example: 1
+        camas:
+          type: string
+          maxLength: 100
+        metrosCuadrados:
+          type: integer
+          minimum: 5
+          maximum: 1000
+        regimen:
+          $ref: '#/components/schemas/RegimenHospedajeEnum'
+        precioBaseNoche:
+          allOf:
+          - $ref: '#/components/schemas/Money'
+          description: Precio del plan por defecto (atajo; el detalle está en `planesTarifa`).
+          example: '120.00'
+        habitacionesTotales:
+          type: integer
+          minimum: 0
+          example: 10
+        habitacionesDisponibles:
+          type: integer
+          minimum: 0
+          example: 4
+          description: Indicativo (puede estar desactualizado). La verdad está en `POST /availability` y en `/inventario`.
+        amenidadesHabitacion:
+          type: array
+          maxItems: 40
+          items:
+            type: string
+            maxLength: 60
+        fotos:
+          type: array
+          maxItems: 20
+          items:
+            type: string
+            format: uri
+        planesTarifa:
+          type: array
+          minItems: 1
+          maxItems: 20
+          items:
+            $ref: '#/components/schemas/RatePlanV2'
+    HabitacionesResponseV2:
+      type: object
+      required:
+      - alojamientoId
+      - habitaciones
+      properties:
+        alojamientoId:
+          type: string
+          example: HTL-QUITO-001
+          maxLength: 200
+        alojamientoNombre:
+          type: string
+          maxLength: 150
+        habitaciones:
+          type: array
+          maxItems: 50
+          items:
+            $ref: '#/components/schemas/TipoHabitacionV2'
+    CategoriaAlojamientoV2:
+      type: object
+      required:
+      - id
+      - nombre
+      - slug
+      properties:
+        id:
+          type: string
+          example: cat-hotel-boutique
+          maxLength: 200
+        nombre:
+          type: string
+          maxLength: 100
+        slug:
+          type: string
+          pattern: ^[a-z0-9-]{2,60}$
+          example: hoteles-boutique
+        descripcion:
+          type: string
+          maxLength: 300
+        icono:
+          type: string
+          maxLength: 40
+        tiene_piscina:
+          type: boolean
+        incluye_desayuno:
+          type: boolean
+        admite_mascotas:
+          type: boolean
+        cancelacion_gratuita:
+          type: boolean
+        orden:
+          type: integer
+          minimum: 0
+    AvailabilityRequestV2:
+      type: object
+      additionalProperties: false
+      required:
+      - alojamientoId
+      - fechaInicio
+      - fechaFin
+      - tipoHabitacionCodigo
+      properties:
+        alojamientoId:
+          $ref: '#/components/schemas/AlojamientoId'
+        fechaInicio:
+          type: string
+          format: date
+          example: '2026-11-01'
+        fechaFin:
+          type: string
+          format: date
+          example: '2026-11-05'
+        tipoHabitacionCodigo:
+          type: string
+          pattern: ^[A-Z0-9_]{2,40}$
+          example: SUITE_DELUXE
+        cantidadHabitaciones:
+          type: integer
+          minimum: 1
+          maximum: 10
+          default: 1
+        ocupantes:
+          $ref: '#/components/schemas/Ocupantes'
+        regimenSeleccionado:
+          $ref: '#/components/schemas/RegimenHospedajeEnum'
+        currency:
+          $ref: '#/components/schemas/CurrencyCode'
+        planTarifaCodigo:
+          type: string
+          pattern: ^[A-Z0-9_]{2,30}$
+          example: FLEX_BB
+          description: Plan de tarifa. Si falta, se usa el plan por defecto de la habitación. Plan inexistente → `404 NOT_FOUND`.
+    DesglosePrecioV2:
+      type: object
+      required:
+      - precioNoche
+      - subtotal
+      - ivaPorcentaje
+      - ivaValor
+      - tasaMunicipal
+      - descuentoCombo
+      - totalPagar
+      - nochesDetalle
+      properties:
+        precioNoche:
+          allOf:
+          - $ref: '#/components/schemas/Money'
+          example: '120.00'
+        subtotal:
+          allOf:
+          - $ref: '#/components/schemas/Money'
+          example: '480.00'
+        ivaPorcentaje:
+          type: number
+          minimum: 0
+          maximum: 100
+          example: 15.0
+        ivaValor:
+          allOf:
+          - $ref: '#/components/schemas/Money'
+          example: '72.00'
+        iva15Pct:
+          allOf:
+          - $ref: '#/components/schemas/Money'
+          deprecated: true
+          description: Alias deprecado de `ivaValor` (se elimina en v3).
+          example: '72.00'
+        tasaMunicipal:
+          allOf:
+          - $ref: '#/components/schemas/Money'
+          example: '8.00'
+        descuentoCombo:
+          allOf:
+          - $ref: '#/components/schemas/Money'
+          example: '0.00'
+        totalPagar:
+          allOf:
+          - $ref: '#/components/schemas/Money'
+          description: subtotal + ivaValor + tasaMunicipal − descuentoCombo (exacto).
+          example: '560.00'
+        impuestos:
+          type: array
+          maxItems: 10
+          items:
+            $ref: '#/components/schemas/ImpuestoLineaV2'
+          description: Desglose por impuesto (aditivo). `sum(impuestos[].monto no incluidos)` = `ivaValor + tasaMunicipal`.
+          example:
+          - codigo: IVA
+            nombre: IVA 15 %
+            porcentaje: 15.0
+            monto: '72.00'
+            incluidoEnPrecio: false
+          - codigo: TASA_MUNICIPAL
+            nombre: Tasa municipal
+            monto: '8.00'
+            incluidoEnPrecio: false
+        nochesDetalle:
+          type: array
+          minItems: 1
+          maxItems: 30
+          items:
+            $ref: '#/components/schemas/NocheDetalleV2'
+          description: Precio noche por noche (las tarifas pueden variar por fecha). `subtotal` = suma exacta de estas líneas.
+          example:
+          - fecha: '2026-11-01'
+            precio: '120.00'
+          - fecha: '2026-11-02'
+            precio: '120.00'
+          - fecha: '2026-11-03'
+            precio: '120.00'
+          - fecha: '2026-11-04'
+            precio: '120.00'
+    AvailabilityResponseV2:
+      type: object
+      required:
+      - alojamientoId
+      - tipoHabitacionCodigo
+      - estaDisponible
+      - habitacionesRemanentes
+      - precioTotalCotizado
+      properties:
+        alojamientoId:
+          type: string
+          example: HTL-QUITO-001
+          maxLength: 200
+        tipoHabitacionCodigo:
+          type: string
+          example: SUITE_DELUXE
+          maxLength: 200
+        estaDisponible:
+          type: boolean
+          example: true
+        habitacionesRemanentes:
+          type: integer
+          minimum: 0
+          example: 4
+          description: Cupo mínimo remanente en todas las noches del rango.
+        nochesEstancia:
+          type: integer
+          minimum: 1
+          maximum: 30
+          example: 4
+        desglosePrecio:
+          $ref: '#/components/schemas/DesglosePrecioV2'
+        precioTotalCotizado:
+          allOf:
+          - $ref: '#/components/schemas/Money'
+          example: '560.00'
+        cotizacionId:
+          type: string
+          format: uuid
+          example: 3f2b8a52-6d3e-4a43-9a0e-1f6d7a9b2c11
+        tarifaValidaHasta:
+          type: string
+          format: date-time
+          example: '2026-10-22T20:30:00-05:00'
+          description: TTL de 30 min del precio. No retiene inventario.
+        _links:
+          $ref: '#/components/schemas/HateoasLinksV2'
+        currency:
+          $ref: '#/components/schemas/CurrencyCode'
+        planTarifaCodigo:
+          type: string
+          example: FLEX_BB
+          maxLength: 200
+        modeloPago:
+          $ref: '#/components/schemas/ModeloPago'
+        politicaCancelacion:
+          $ref: '#/components/schemas/PoliticaCancelacionV2'
+    AvailabilityOptionV2:
+      type: object
+      required:
+      - tipoHabitacionCodigo
+      - estaDisponible
+      - habitacionesRemanentes
+      - precioNoche
+      - precioTotalEstancia
+      - planTarifaCodigo
+      properties:
+        tipoHabitacionCodigo:
+          type: string
+          example: SUITE_DELUXE
+          maxLength: 200
+        nombre:
+          type: string
+          maxLength: 100
+        estaDisponible:
+          type: boolean
+        habitacionesRemanentes:
+          type: integer
+          minimum: 0
+        precioNoche:
+          $ref: '#/components/schemas/Money'
+        precioTotalEstancia:
+          allOf:
+          - $ref: '#/components/schemas/Money'
+          description: Con impuestos; indicativo, no vinculante.
+          example: '560.00'
+        regimen:
+          $ref: '#/components/schemas/RegimenHospedajeEnum'
+        planTarifaCodigo:
+          type: string
+          example: FLEX_BB
+          maxLength: 200
+    AvailabilityListResponseV2:
+      type: object
+      required:
+      - alojamientoId
+      - checkin
+      - checkout
+      - noches
+      - opciones
+      properties:
+        alojamientoId:
+          type: string
+          maxLength: 200
+        checkin:
+          type: string
+          format: date
+        checkout:
+          type: string
+          format: date
+        noches:
+          type: integer
+          minimum: 1
+          maximum: 30
+        opciones:
+          type: array
+          maxItems: 50
+          items:
+            $ref: '#/components/schemas/AvailabilityOptionV2'
+    InventarioNocheV2:
+      type: object
+      required:
+      - fecha
+      - tipoHabitacionCodigo
+      - habitacionesTotales
+      - reservadas
+      - bloqueadas
+      - disponibles
+      properties:
+        fecha:
+          type: string
+          format: date
+        tipoHabitacionCodigo:
+          type: string
+          maxLength: 200
+        habitacionesTotales:
+          type: integer
+          minimum: 0
+        reservadas:
+          type: integer
+          minimum: 0
+        bloqueadas:
+          type: integer
+          minimum: 0
+          description: Mantenimiento/limpieza/bloqueo manual.
+        disponibles:
+          type: integer
+          minimum: 0
+          description: totales − reservadas − bloqueadas.
+        tarifas:
+          type: array
+          maxItems: 20
+          items:
+            $ref: '#/components/schemas/TarifaPlanNocheV2'
+          description: Tarifa y restricciones por plan esa noche (completa el modelo ARI).
+    InventarioResponseV2:
+      type: object
+      required:
+      - alojamientoId
+      - desde
+      - hasta
+      - generadoEn
+      - hash
+      - noches
+      properties:
+        alojamientoId:
+          type: string
+          maxLength: 200
+        desde:
+          type: string
+          format: date
+        hasta:
+          type: string
+          format: date
+        generadoEn:
+          type: string
+          format: date-time
+        hash:
+          type: string
+          maxLength: 64
+          description: Huella del contenido; comparable con `last_sync_hash` del stream gRPC.
+        noches:
+          type: array
+          maxItems: 3000
+          items:
+            $ref: '#/components/schemas/InventarioNocheV2'
+    HuespedTitularBaseV2:
+      type: object
+      required:
+      - nombreCompleto
+      - tipoDocumento
+      - identificacion
+      - email
+      - telefono
+      properties:
+        nombreCompleto:
+          type: string
+          minLength: 3
+          maxLength: 120
+          pattern: ^\S+(\s+\S+)+$
+          description: Al menos dos palabras.
+          example: Joselyn Cadena
+          x-pii: true
+        tipoDocumento:
+          type: string
+          enum:
+          - CEDULA
+          - PASAPORTE
+          - RUC
+        identificacion:
+          type: string
+          maxLength: 13
+          x-pii: true
+        email:
+          type: string
+          format: email
+          maxLength: 120
+          example: jlcadenac@puce.edu.ec
+          x-pii: true
+        telefono:
+          $ref: '#/components/schemas/TelefonoE164OLocal'
+          x-pii: true
+        nacionalidad:
+          type: string
+          maxLength: 60
+          example: Ecuatoriana
+          x-pii: true
+    HuespedTitularV2:
+      description: |
+        Titular de la reserva. El patrón de `identificacion` depende de `tipoDocumento`
+        (discriminador). Para `CEDULA` el servidor además verifica el **módulo 10** → `422 INVALID_DOCUMENT`.
+      oneOf:
+      - $ref: '#/components/schemas/HuespedTitularCedulaV2'
+      - $ref: '#/components/schemas/HuespedTitularPasaporteV2'
+      - $ref: '#/components/schemas/HuespedTitularRucV2'
+      discriminator:
+        propertyName: tipoDocumento
+        mapping:
+          CEDULA: '#/components/schemas/HuespedTitularCedulaV2'
+          PASAPORTE: '#/components/schemas/HuespedTitularPasaporteV2'
+          RUC: '#/components/schemas/HuespedTitularRucV2'
+    HuespedTitularCedulaV2:
+      allOf:
+      - $ref: '#/components/schemas/HuespedTitularBaseV2'
+      - type: object
+        properties:
+          tipoDocumento:
+            type: string
+            enum:
+            - CEDULA
+          identificacion:
+            type: string
+            pattern: ^[0-9]{10}$
+            example: '1712345675'
+            x-pii: true
+    HuespedTitularPasaporteV2:
+      allOf:
+      - $ref: '#/components/schemas/HuespedTitularBaseV2'
+      - type: object
+        properties:
+          tipoDocumento:
+            type: string
+            enum:
+            - PASAPORTE
+          identificacion:
+            type: string
+            pattern: ^[A-Z0-9]{6,12}$
+            example: AB1234567
+            x-pii: true
+    HuespedTitularRucV2:
+      allOf:
+      - $ref: '#/components/schemas/HuespedTitularBaseV2'
+      - type: object
+        properties:
+          tipoDocumento:
+            type: string
+            enum:
+            - RUC
+          identificacion:
+            type: string
+            pattern: ^[0-9]{13}$
+            example: '1712345675001'
+            x-pii: true
+    CustomerContactDto:
+      type: object
+      deprecated: true
+      description: Alias **deprecado** de `huespedTitular`. Ver la regla de exclusión en `OrderCreateRequestV2`.
+      required:
+      - full_name
+      - email
+      - phone
+      - document_type
+      - document_id
+      properties:
+        full_name:
+          type: string
+          minLength: 3
+          maxLength: 120
+          pattern: ^\S+(\s+\S+)+$
+          example: Joselyn Cadena
+          x-pii: true
+        email:
+          type: string
+          format: email
+          maxLength: 120
+          x-pii: true
+        phone:
+          $ref: '#/components/schemas/TelefonoE164OLocal'
+          x-pii: true
+        document_type:
+          type: string
+          enum:
+          - CEDULA
+          - PASAPORTE
+          - RUC
+        document_id:
+          type: string
+          maxLength: 13
+          pattern: ^([0-9]{10}|[A-Z0-9]{6,12}|[0-9]{13})$
+          example: '1712345675'
+          x-pii: true
+    HuespedAcompananteV2:
+      type: object
+      required:
+      - nombreCompleto
+      properties:
+        nombreCompleto:
+          type: string
+          minLength: 2
+          maxLength: 120
+          example: María José Mendoza
+          x-pii: true
+        tipoDocumento:
+          type: string
+          enum:
+          - CEDULA
+          - PASAPORTE
+          - MENOR_SIN_DOC
+          default: CEDULA
+        identificacion:
+          type: string
+          maxLength: 13
+          pattern: ^([0-9]{10}|[A-Z0-9]{6,12}|[0-9]{13})?$
+          example: '1719876540'
+          x-pii: true
+        esMenorEdad:
+          type: boolean
+        edad:
+          type: integer
+          minimum: 0
+          maximum: 120
+          description: Obligatoria si `esMenorEdad` es true.
+          x-pii: true
+    OrderCreateRequestV2:
+      type: object
+      additionalProperties: false
+      required:
+      - alojamientoId
+      - tipoHabitacionCodigo
+      - fechaInicio
+      - fechaFin
+      - ocupantes
+      - totalPagar
+      properties:
+        alojamientoId:
+          $ref: '#/components/schemas/AlojamientoId'
+        tipoHabitacionCodigo:
+          type: string
+          pattern: ^[A-Z0-9_]{2,40}$
+          example: SUITE_DELUXE
+        fechaInicio:
+          type: string
+          format: date
+          description: Check-in (≥ hoy en Guayaquil).
+          example: '2026-11-01'
+        fechaFin:
+          type: string
+          format: date
+          description: Check-out (> fechaInicio; ≤ 30 noches).
+          example: '2026-11-05'
+        cantidadHabitaciones:
+          type: integer
+          minimum: 1
+          maximum: 10
+          default: 1
+        ocupantes:
+          $ref: '#/components/schemas/Ocupantes'
+        regimenSeleccionado:
+          $ref: '#/components/schemas/RegimenHospedajeEnum'
+        cotizacionId:
+          type: string
+          format: uuid
+          description: Cotización de `POST /availability`. Si se envía, fija el precio; si venció → `409 QUOTE_EXPIRED`.
+        totalPagar:
+          allOf:
+          - $ref: '#/components/schemas/Money'
+          description: Total final con impuestos y descuento de combo. Si no coincide **exactamente** con la tarifa vigente
+            → `409 PRICE_MISMATCH`.
+          example: '560.00'
+        currency:
+          $ref: '#/components/schemas/CurrencyCode'
+        paquete:
+          $ref: '#/components/schemas/PaqueteAplicadoV2'
+        payment_method:
+          $ref: '#/components/schemas/PaymentMethod'
+        payment_reference:
+          type: string
+          maxLength: 64
+          description: Código de autorización de MS_PAG.
+          example: AUTH-VISA-982341
+        saga_id:
+          type: string
+          maxLength: 64
+          description: Identificador de la Saga (MS_ORQ). Permite recuperación por `GET /orders?saga_id=`.
+        idempotency_key:
+          type: string
+          format: uuid
+          deprecated: true
+          description: Duplicado de la cabecera (**deprecado**). Si viene, debe ser igual a `Idempotency-Key`; si no → `422
+            VALIDATION_FAILED` (el esquema no puede comparar cuerpo y cabecera).
+        huespedTitular:
+          $ref: '#/components/schemas/HuespedTitularV2'
+        customer_contact:
+          $ref: '#/components/schemas/CustomerContactDto'
+        huespedesAdicionales:
+          type: array
+          maxItems: 20
+          items:
+            $ref: '#/components/schemas/HuespedAcompananteV2'
+        peticionesEspeciales:
+          type: string
+          maxLength: 500
+        planTarifaCodigo:
+          type: string
+          pattern: ^[A-Z0-9_]{2,30}$
+          example: FLEX_BB
+          description: Plan de tarifa. Si falta, se usa el plan por defecto de la habitación. Plan inexistente → `404 NOT_FOUND`.
+      anyOf:
+      - required:
+        - huespedTitular
+      - required:
+        - customer_contact
+      description: Se exige **al menos uno** de `huespedTitular` o `customer_contact` (formato común de las 4 verticales,
+        deprecado). Si vienen ambos, manda `huespedTitular`. Con solo `customer_contact`, el nodo lo mapea a titular (`document_type`→`tipoDocumento`,
+        `document_id`→`identificacion`, `full_name`→`nombreCompleto`, `phone`→`telefono`) y aplica las mismas validaciones
+        (`422 INVALID_DOCUMENT`).
+    DesgloseFiscalV2:
+      type: object
+      required:
+      - subtotal
+      - ivaPorcentaje
+      - ivaValor
+      - tasaMunicipal
+      - descuentoCombo
+      - total
+      properties:
+        subtotal:
+          allOf:
+          - $ref: '#/components/schemas/Money'
+          example: '480.00'
+        ivaPorcentaje:
+          type: number
+          minimum: 0
+          maximum: 100
+          example: 15.0
+        ivaValor:
+          allOf:
+          - $ref: '#/components/schemas/Money'
+          example: '72.00'
+        iva15Pct:
+          allOf:
+          - $ref: '#/components/schemas/Money'
+          deprecated: true
+          description: Alias deprecado de `ivaValor` (se elimina en v3).
+          example: '72.00'
+        tasaMunicipal:
+          allOf:
+          - $ref: '#/components/schemas/Money'
+          example: '8.00'
+        descuentoCombo:
+          allOf:
+          - $ref: '#/components/schemas/Money'
+          example: '0.00'
+        total:
+          allOf:
+          - $ref: '#/components/schemas/Money'
+          description: subtotal + ivaValor + tasaMunicipal − descuentoCombo (exacto).
+          example: '560.00'
+        impuestos:
+          type: array
+          maxItems: 10
+          items:
+            $ref: '#/components/schemas/ImpuestoLineaV2'
+          description: Desglose por impuesto (aditivo). `sum(impuestos[].monto no incluidos)` = `ivaValor + tasaMunicipal`.
+          example:
+          - codigo: IVA
+            nombre: IVA 15 %
+            porcentaje: 15.0
+            monto: '72.00'
+            incluidoEnPrecio: false
+          - codigo: TASA_MUNICIPAL
+            nombre: Tasa municipal
+            monto: '8.00'
+            incluidoEnPrecio: false
+    OrderDetailV2:
+      type: object
+      required:
+      - orderId
+      - external_order_id
+      - codigoReserva
+      - estado
+      - alojamientoId
+      - alojamientoNombre
+      - tipoHabitacion
+      - checkinFecha
+      - checkoutFecha
+      - noches
+      - desgloseFiscal
+      - total
+      - createdAt
+      properties:
+        orderId:
+          type: string
+          format: uuid
+          example: c1a2b3c4-d5e6-7890-1234-567890abcdef
+        external_order_id:
+          type: string
+          pattern: ^ORD-HTL-[A-Z0-9]{3,20}$
+          example: ORD-HTL-8842
+          description: Llave de negocio que el ESB persiste en `facturas_detalle`.
+        externalOrderId:
+          type: string
+          deprecated: true
+          description: Alias camelCase de `external_order_id`.
+          example: ORD-HTL-8842
+          maxLength: 200
+        codigoReserva:
+          type: string
+          pattern: ^BK-HOTEL-[A-Z0-9]{3,20}$
+          example: BK-HOTEL-9912
+        estado:
+          $ref: '#/components/schemas/ReservationStatus'
+        saga_id:
+          type: string
+          maxLength: 64
+        alojamientoId:
+          type: string
+          example: HTL-QUITO-001
+          maxLength: 200
+        alojamientoNombre:
+          type: string
+          maxLength: 150
+        tipoHabitacionCodigo:
+          type: string
+          example: SUITE_DELUXE
+          maxLength: 200
+        tipoHabitacion:
+          type: string
+          maxLength: 100
+          example: Suite Deluxe Matrimonial
+        cantidadHabitaciones:
+          type: integer
+          minimum: 1
+        ocupantes:
+          $ref: '#/components/schemas/Ocupantes'
+        regimen:
+          $ref: '#/components/schemas/RegimenHospedajeEnum'
+        checkinFecha:
+          type: string
+          format: date
+          example: '2026-11-01'
+        checkoutFecha:
+          type: string
+          format: date
+          example: '2026-11-05'
+        noches:
+          type: integer
+          minimum: 1
+          maximum: 30
+          example: 4
+        checkinHabilitadoDesde:
+          type: string
+          format: date-time
+          example: '2026-11-01T14:00:00-05:00'
+          description: Instante desde el cual el check-in digital está permitido (considera early check-in).
+        earlyCheckinAutorizado:
+          type: boolean
+          default: false
+        cotizacionId:
+          type: string
+          format: uuid
+        huespedTitular:
+          $ref: '#/components/schemas/HuespedTitularV2'
+        desgloseFiscal:
+          $ref: '#/components/schemas/DesgloseFiscalV2'
+        total:
+          allOf:
+          - $ref: '#/components/schemas/Money'
+          example: '560.00'
+        currency:
+          $ref: '#/components/schemas/CurrencyCode'
+        politicaCancelacionAplicable:
+          type: object
+          properties:
+            reembolso100HastaFecha:
+              type: string
+              format: date-time
+              example: '2026-10-30T14:00:00-05:00'
+            descripcion:
+              type: string
+              maxLength: 300
+            esReembolsable:
+              type: boolean
+              example: true
+        habitacionAsignada:
+          type: string
+          nullable: true
+          maxLength: 100
+          example: null
+        claveAccesoDigital:
+          type: string
+          nullable: true
+          maxLength: 40
+          example: null
+        historialEstados:
+          type: array
+          maxItems: 20
+          items:
+            type: object
+            required:
+            - estado
+            - en
+            properties:
+              estado:
+                $ref: '#/components/schemas/ReservationStatus'
+              en:
+                type: string
+                format: date-time
+        createdAt:
+          type: string
+          format: date-time
+          example: '2026-10-22T20:00:00-05:00'
+        _links:
+          $ref: '#/components/schemas/HateoasLinksV2'
+        planTarifaCodigo:
+          type: string
+          example: FLEX_BB
+          maxLength: 200
+        modeloPago:
+          $ref: '#/components/schemas/ModeloPago'
+    OrderListResponseV2:
+      type: object
+      required:
+      - metadata
+      - data
+      properties:
+        metadata:
+          $ref: '#/components/schemas/PaginationMetadata'
+        data:
+          type: array
+          maxItems: 50
+          items:
+            $ref: '#/components/schemas/OrderDetailV2'
+    ReservationSummaryV2:
+      type: object
+      required:
+      - id
+      - reservation_code
+      - external_order_id
+      - accommodation_id
+      - accommodation_name
+      - room_type
+      - checkin
+      - checkout
+      - status
+      - total_price
+      properties:
+        id:
+          type: string
+          format: uuid
+          description: = `orderId` (UUID).
+          example: c1a2b3c4-d5e6-7890-1234-567890abcdef
+        reservation_code:
+          type: string
+          example: BK-HOTEL-9912
+          maxLength: 200
+        external_order_id:
+          type: string
+          example: ORD-HTL-8842
+          maxLength: 200
+        accommodation_id:
+          type: string
+          example: HTL-QUITO-001
+          maxLength: 200
+        accommodation_name:
+          type: string
+          maxLength: 150
+        room_type:
+          type: string
+          example: SUITE_DELUXE
+          maxLength: 200
+        checkin:
+          type: string
+          format: date
+        checkout:
+          type: string
+          format: date
+        number_of_rooms:
+          type: integer
+          minimum: 1
+        guests:
+          type: object
+          properties:
+            adults:
+              type: integer
+              minimum: 0
+            children:
+              type: integer
+              minimum: 0
+        total_price:
+          allOf:
+          - $ref: '#/components/schemas/Money'
+          example: '560.00'
+        currency:
+          $ref: '#/components/schemas/CurrencyCode'
+        status:
+          $ref: '#/components/schemas/ReservationStatus'
+        created_at:
+          type: string
+          format: date-time
+    ReservationListResponseV2:
+      type: object
+      required:
+      - metadata
+      - data
+      properties:
+        metadata:
+          $ref: '#/components/schemas/PaginationMetadata'
+        data:
+          type: array
+          maxItems: 50
+          items:
+            $ref: '#/components/schemas/ReservationSummaryV2'
+    CancelOrderRequestV2:
+      type: object
+      additionalProperties: false
+      properties:
+        motivo:
+          type: string
+          maxLength: 300
+          example: 'Compensación de Saga: rechazo en reserva de vuelo'
+        solicitadoPor:
+          type: string
+          enum:
+          - SAGA_ORCHESTRATOR
+          - CLIENTE
+          - ADMIN
+          - HOTEL
+          default: CLIENTE
+    CancelOrderResponseV2:
+      type: object
+      required:
+      - orderId
+      - external_order_id
+      - estado
+      - refundStatus
+      - codigoReembolso
+      - porcentajeReembolso
+      - montoReembolsado
+      - cuposRestaurados
+      - yaCancelada
+      - timestamp
+      properties:
+        orderId:
+          type: string
+          format: uuid
+        external_order_id:
+          type: string
+          example: ORD-HTL-8842
+          maxLength: 200
+        estado:
+          type: string
+          enum:
+          - CANCELLED
+        refundStatus:
+          type: string
+          enum:
+          - COMPENSATED
+          - REFUNDED
+          - NO_REFUND
+        codigoReembolso:
+          type: string
+          pattern: ^REF-HTL-[0-9]{5,10}$
+          example: REF-HTL-77491
+          description: 'Estable: un reintento devuelve el mismo código.'
+        porcentajeReembolso:
+          type: number
+          minimum: 0
+          maximum: 100
+          example: 100
+        montoReembolsado:
+          allOf:
+          - $ref: '#/components/schemas/Money'
+          example: '560.00'
+        penalidad:
+          allOf:
+          - $ref: '#/components/schemas/Money'
+          example: '0.00'
+        cuposRestaurados:
+          type: boolean
+          example: true
+        yaCancelada:
+          type: boolean
+          example: false
+          description: '`true` si la reserva ya estaba cancelada (repetición idempotente).'
+        timestamp:
+          type: string
+          format: date-time
+          example: '2026-10-22T20:05:00-05:00'
+        _links:
+          $ref: '#/components/schemas/HateoasLinksV2'
+    CheckInRequestV2:
+      type: object
+      additionalProperties: false
+      required:
+      - titularIdentificacion
+      properties:
+        titularIdentificacion:
+          type: string
+          pattern: ^[A-Za-z0-9]{6,13}$
+          example: '1712345675'
+          description: Debe coincidir con el titular de la reserva.
+          x-pii: true
+        horaLlegadaEstimada:
+          type: string
+          pattern: ^([01][0-9]|2[0-3]):[0-5][0-9]$
+          example: '15:30'
+        peticionesEspeciales:
+          type: string
+          maxLength: 500
+    CheckInResponseV2:
+      type: object
+      required:
+      - reservaId
+      - estado
+      - habitacionAsignada
+      - claveAccesoDigital
+      - checkInHora
+      properties:
+        reservaId:
+          type: string
+          format: uuid
+        estado:
+          type: string
+          enum:
+          - CHECKED_IN
+        habitacionAsignada:
+          type: string
+          maxLength: 100
+          example: Suite 402 - Torre Ejecutiva
+        claveAccesoDigital:
+          type: string
+          maxLength: 40
+          example: PIN-9812#
+          description: 'Credencial **secreta**: no registrar en logs, no incluir en eventos, no cachear.'
+          x-secret: true
+        checkInHora:
+          type: string
+          format: date-time
+          example: '2026-11-01T14:15:00-05:00'
+        instruccionesAcceso:
+          type: string
+          maxLength: 300
+        _links:
+          $ref: '#/components/schemas/HateoasLinksV2'
+    EarlyCheckinRequestV2:
+      type: object
+      additionalProperties: false
+      required:
+      - autorizado
+      properties:
+        autorizado:
+          type: boolean
+          example: true
+        habilitadoDesde:
+          type: string
+          format: date-time
+          example: '2026-11-01T10:00:00-05:00'
+          description: Opcional; si falta, el check-in se habilita de inmediato.
+        motivo:
+          type: string
+          maxLength: 200
+    CheckOutRequestV2:
+      type: object
+      additionalProperties: false
+      properties:
+        consumosMinibar:
+          type: array
+          maxItems: 50
+          items:
+            type: object
+            required:
+            - item
+            - precio
+            properties:
+              item:
+                type: string
+                maxLength: 80
+                example: Agua mineral con gas
+              cantidad:
+                type: integer
+                minimum: 1
+                maximum: 100
+                default: 1
+              precio:
+                allOf:
+                - $ref: '#/components/schemas/Money'
+                description: Precio unitario.
+                example: '3.50'
+        metodoPagoConsumos:
+          type: string
+          enum:
+          - TARJETA_REGISTRADA
+          - EFECTIVO
+          - CARGO_A_RESERVA
+    CheckOutResponseV2:
+      type: object
+      required:
+      - orderId
+      - estado
+      - habitacionLiberada
+      - consumosAdicionales
+      - claveDigitalRevocada
+      properties:
+        orderId:
+          type: string
+          format: uuid
+        estado:
+          type: string
+          enum:
+          - CHECKED_OUT
+        habitacionLiberada:
+          type: string
+          maxLength: 100
+          example: Suite 402
+        checkOutHora:
+          type: string
+          format: date-time
+          example: '2026-11-05T10:45:00-05:00'
+        consumosAdicionales:
+          allOf:
+          - $ref: '#/components/schemas/Money'
+          example: '3.50'
+        comprobanteCheckOutUrl:
+          type: string
+          format: uri
+        claveDigitalRevocada:
+          type: boolean
+          example: true
+        _links:
+          $ref: '#/components/schemas/HateoasLinksV2'
+    ResenaUsuarioV2:
+      type: object
+      required:
+      - id
+      - autorNombre
+      - calificacionGlobal
+      - fecha
+      - comentario
+      properties:
+        id:
+          type: string
+          example: REV-ALO-8912
+          maxLength: 200
+        autorNombre:
+          type: string
+          maxLength: 100
+          description: Nombre público (primer nombre + inicial).
+        autorPais:
+          type: string
+          maxLength: 60
+        calificacionGlobal:
+          type: number
+          minimum: 1
+          maximum: 10
+          example: 9.6
+        desgloseCalificaciones:
+          $ref: '#/components/schemas/DesgloseCalificacionesV2'
+        fecha:
+          type: string
+          format: date
+        comentario:
+          type: string
+          minLength: 10
+          maxLength: 2000
+        tipoViaje:
+          type: string
+          enum:
+          - SOLO
+          - PAREJA
+          - FAMILIA
+          - NEGOCIOS
+          - GRUPO
+        estadiaVerificada:
+          type: boolean
+        tipoHabitacionAlojado:
+          type: string
+          maxLength: 100
+    CrearResenaRequestV2:
+      type: object
+      additionalProperties: false
+      required:
+      - reservaId
+      - calificacionGlobal
+      - comentario
+      properties:
+        reservaId:
+          $ref: '#/components/schemas/OrderRef'
+        calificacionGlobal:
+          type: number
+          minimum: 1
+          maximum: 10
+          example: 9.5
+        desgloseCalificaciones:
+          $ref: '#/components/schemas/DesgloseCalificacionesV2'
+        comentario:
+          type: string
+          minLength: 10
+          maxLength: 2000
+        tipoViaje:
+          type: string
+          enum:
+          - SOLO
+          - PAREJA
+          - FAMILIA
+          - NEGOCIOS
+          - GRUPO
+    ListadoResenasResponseV2:
+      type: object
+      required:
+      - alojamientoId
+      - scorePromedio
+      - totalResenas
+      - metadata
+      - resenas
+      properties:
+        alojamientoId:
+          type: string
+          maxLength: 200
+        scorePromedio:
+          type: number
+          minimum: 0
+          maximum: 10
+        totalResenas:
+          type: integer
+          minimum: 0
+        desglosePromedio:
+          $ref: '#/components/schemas/DesgloseCalificacionesV2'
+        metadata:
+          $ref: '#/components/schemas/PaginationMetadata'
+        resenas:
+          type: array
+          maxItems: 50
+          items:
+            $ref: '#/components/schemas/ResenaUsuarioV2'
+    Money:
+      type: string
+      pattern: ^(0|[1-9][0-9]{0,8})\.[0-9]{2}$
+      maxLength: 12
+      example: '560.00'
+      description: 'Importe monetario como **string decimal exacto con 2 decimales** (`"560.00"`). Nunca `number`: los flotantes
+        binarios no representan 0.10 ni 0.20 con exactitud y las sumas de líneas dejan de cuadrar. Sin separador de miles,
+        punto decimal, sin signo (los importes son ≥ 0). La moneda va en el campo `currency` (ISO 4217).'
+    CurrencyCode:
+      type: string
+      pattern: ^[A-Z]{3}$
+      default: USD
+      example: USD
+      description: 'Código ISO 4217. El esquema admite cualquier moneda; **este nodo opera solo en `USD`**: otra moneda →
+        `422 UNSUPPORTED_CURRENCY`. Así el contrato no cambia cuando se agreguen monedas.'
+    ImpuestoLineaV2:
+      type: object
+      required:
+      - codigo
+      - monto
+      - incluidoEnPrecio
+      properties:
+        codigo:
+          type: string
+          enum:
+          - IVA
+          - TASA_MUNICIPAL
+          - SERVICIO
+          example: IVA
+        nombre:
+          type: string
+          maxLength: 80
+          example: IVA 15 %
+        porcentaje:
+          type: number
+          minimum: 0
+          maximum: 100
+          example: 15.0
+          description: Solo si el impuesto es porcentual.
+        monto:
+          $ref: '#/components/schemas/Money'
+        incluidoEnPrecio:
+          type: boolean
+          example: false
+          description: '`true` si el monto ya está dentro de la tarifa publicada (no se suma de nuevo).'
+    NocheDetalleV2:
+      type: object
+      required:
+      - fecha
+      - precio
+      properties:
+        fecha:
+          type: string
+          format: date
+          example: '2026-11-01'
+        precio:
+          allOf:
+          - $ref: '#/components/schemas/Money'
+          description: Total de la noche para **todas** las habitaciones (incluye suplementos de ocupación).
+          example: '120.00'
+    ModeloPago:
+      type: string
+      enum:
+      - PREPAGO
+      - PAGO_EN_HOTEL
+      - GARANTIA_TARJETA
+      example: PREPAGO
+      description: '`PREPAGO`: se cobra al reservar. `PAGO_EN_HOTEL`: se paga en recepción. `GARANTIA_TARJETA`: tarjeta como
+        garantía, cobro en el hotel.'
+    PoliticaNinosV2:
+      type: object
+      required:
+      - edadMaximaGratis
+      - suplementoNino
+      properties:
+        edadMaximaGratis:
+          type: integer
+          minimum: 0
+          maximum: 17
+          example: 5
+          description: Los niños de esta edad o menos no pagan suplemento.
+        suplementoNino:
+          allOf:
+          - $ref: '#/components/schemas/Money'
+          description: Por niño que paga, por noche.
+          example: '10.00'
+    RatePlanV2:
+      type: object
+      required:
+      - codigo
+      - nombre
+      - regimen
+      - modeloPago
+      - politicaCancelacion
+      - ocupacionBase
+      - precioBaseNoche
+      - impuestosIncluidos
+      - esPlanPorDefecto
+      description: 'Plan de tarifa: una misma habitación se vende con distintas condiciones (reembolsable / no reembolsable,
+        con/sin desayuno).'
+      properties:
+        codigo:
+          type: string
+          pattern: ^[A-Z0-9_]{2,30}$
+          example: FLEX_BB
+        nombre:
+          type: string
+          maxLength: 100
+          example: Flexible con desayuno
+        regimen:
+          $ref: '#/components/schemas/RegimenHospedajeEnum'
+        modeloPago:
+          $ref: '#/components/schemas/ModeloPago'
+        politicaCancelacion:
+          $ref: '#/components/schemas/PoliticaCancelacionV2'
+        ocupacionBase:
+          type: integer
+          minimum: 1
+          maximum: 20
+          example: 2
+          description: Adultos incluidos en `precioBaseNoche`.
+        precioBaseNoche:
+          allOf:
+          - $ref: '#/components/schemas/Money'
+          description: Precio por habitación y noche para `ocupacionBase` (tarifa de referencia; puede variar por fecha, ver
+            `/inventario`).
+          example: '120.00'
+        suplementoAdultoExtra:
+          allOf:
+          - $ref: '#/components/schemas/Money'
+          description: Por adulto sobre `ocupacionBase`, por noche.
+          example: '25.00'
+        politicaNinos:
+          $ref: '#/components/schemas/PoliticaNinosV2'
+        impuestosIncluidos:
+          type: boolean
+          example: false
+          description: Si `true`, los impuestos ya forman parte de la tarifa. **Este nodo publica siempre `false`.**
+        esPlanPorDefecto:
+          type: boolean
+          example: true
+          description: Se usa cuando la petición no envía `planTarifaCodigo`. Exactamente un plan por habitación.
+    RestriccionesDiaV2:
+      type: object
+      required:
+      - fecha
+      description: 'Restricciones de venta para una noche (modelo estándar ARI: Availability, Rates, Inventory).'
+      properties:
+        fecha:
+          type: string
+          format: date
+          example: '2026-12-24'
+        estanciaMinima:
+          type: integer
+          minimum: 1
+          maximum: 30
+          default: 1
+          example: 3
+          description: Noches mínimas. Se evalúa con la restricción de la noche de **llegada**.
+        estanciaMaxima:
+          type: integer
+          minimum: 1
+          maximum: 30
+          default: 30
+          example: 30
+          description: Noches máximas (noche de llegada).
+        cerradoALlegada:
+          type: boolean
+          default: false
+          example: false
+          description: No se puede llegar (check-in) esta noche.
+        cerradoASalida:
+          type: boolean
+          default: false
+          example: false
+          description: No se puede salir (check-out) esta fecha. Se evalúa sobre `fechaFin`.
+        ventaCerrada:
+          type: boolean
+          default: false
+          example: false
+          description: '*Stop-sell*: la noche no se vende. Si **cualquier** noche del rango está cerrada, la estancia no se
+            vende.'
+        anticipacionMinimaHoras:
+          type: integer
+          minimum: 0
+          maximum: 8760
+          default: 0
+          example: 0
+          description: Horas mínimas entre la reserva y las 14:00 de la llegada (*cut-off*).
+    TarifaPlanNocheV2:
+      type: object
+      required:
+      - planTarifaCodigo
+      - precioNoche
+      properties:
+        planTarifaCodigo:
+          type: string
+          pattern: ^[A-Z0-9_]{2,30}$
+          example: FLEX_BB
+        precioNoche:
+          allOf:
+          - $ref: '#/components/schemas/Money'
+          description: Precio por habitación para `ocupacionBase` esa noche.
+          example: '120.00'
+        restricciones:
+          $ref: '#/components/schemas/RestriccionesDiaV2'

@@ -1,0 +1,148 @@
+syntax = "proto3";
+
+package inventory;
+
+// ============================================================================
+// CONTRATO PROTOCOL BUFFERS v3: SINCRONIZACIÓN DE INVENTARIO EN TIEMPO REAL
+// ============================================================================
+// Proyecto: Booking Prototipo (Plataforma Central Integradora — RDA2 / EPN)
+// Vertical: Atracciones Turísticas (Integración Multimodal de 5 Tiendas)
+// Rol: Socket Inbound de Ingesta Continua (Tiendas de Compañeros -> Booking)
+// Transporte: HTTP/2 multiplexado binario sobre TCP
+// Puerto Oficial: 50051 (Local: localhost:50051 | Render: booking.epn.edu.ec:50051)
+// Normativa: Cátedra RDA2 §1, §3 y Semana 9 (Estandarización y Resolución de Ambigüedades)
+// ============================================================================
+
+service InventoryStockService {
+  // RPC 1: Actualización puntual de cupos por turno (Push Inbound Unary)
+  // Invocado por la tienda socia ante cada venta propia, anulación o modificación de aforo.
+  rpc PushStockUpdate (StockUpdateMessage) returns (StockUpdateAck);
+
+  // RPC 2: Streaming continuo de eventos de cambio de inventario (Client Streaming)
+  // Permite enviar ráfagas de deltas (+/-) en un solo canal multiplexado de alto rendimiento.
+  rpc StreamInventoryChanges (stream StockChangeEvent) returns (StreamSummary);
+
+  // RPC 3: Consulta puntual de disponibilidad confirmada (Unary Query)
+  // Permite a la tienda socia validar si Booking tiene sincronizado el mismo aforo antes de ventas.
+  rpc GetSlotAvailability (SlotAvailabilityRequest) returns (SlotAvailabilityResponse);
+}
+
+// ----------------------------------------------------------------------------
+// MENSAJES DE DATOS
+// ----------------------------------------------------------------------------
+
+// Mensaje de actualización puntual de stock e inventario
+message StockUpdateMessage {
+  // Código único asignado a la tienda socia registrado en el Booking Gateway
+  // Ejemplo: "NODE_ATR_DILAN", "NODE_ATR_CRUCEROS_01", "NODE_ATR_QUITO_02"
+  string service_id = 1;
+
+  // Identificador único o slug de la atracción en el catálogo compartido
+  // Ejemplo: "PRhu4UBTWPBC", "tour-volcan-pichincha"
+  string item_id = 2;
+
+  // Fecha del turno programado en formato estándar ISO 8601 (YYYY-MM-DD)
+  // Ejemplo: "2026-10-25"
+  string date = 3;
+
+  // Franja horaria legible o en formato militar 24h
+  // Ejemplo: "10:30 a.m." o "10:30:00"
+  string time_slot = 4;
+
+  // Cupos remanentes netos disponibles en la tienda socia en tiempo real
+  // 0 si el turno está completamente agotado; <= 5 activa advertencia ULTIMOS_CUPOS
+  int32 available_units = 5;
+
+  // Timestamp Unix Epoch en milisegundos (Date.now()) al momento de la emisión
+  // REGLA MONOTÓNICA: Booking descarta eventos con timestamp inferior al último procesado
+  int64 timestamp = 6;
+
+  // Identificador unívoco del turno horario para correspondencia con REST checkout
+  // Formato estándar: "slot-YYYYMMDD-HHMM" (Ejemplo: "slot-20261025-1030")
+  string slot_id = 7;
+}
+
+// Acuse de recibo enriquecido emitido por Booking Prototipo
+message StockUpdateAck {
+  // true si el turno fue sincronizado e indexado exitosamente en memoria y PostgreSQL
+  bool success = 1;
+
+  // Mensaje legible explicativo del resultado del procesamiento
+  string message = 2;
+
+  // Timestamp Unix Epoch en milisegundos en el servidor Booking al confirmar la ingesta
+  int64 processed_at = 3;
+
+  // Código estándar de resultado:
+  // "OK"                     -> Procesamiento y persistencia exitosa
+  // "STALE_TIMESTAMP_IGNORED"-> Paquete descartado por ordenamiento monotónico (obsoleto)
+  // "ITEM_NOT_FOUND"         -> La atracción no existe en el catálogo
+  // "INVALID_SLOT"           -> Parámetros de turno horario inválidos
+  string error_code = 4;
+
+  // Cupos vigentes confirmados y bloqueados en Booking tras aplicar la actualización
+  int32 current_available = 5;
+}
+
+// Evento de variación delta transmitido en streaming continuo
+message StockChangeEvent {
+  // UUID v4 único del evento para deduplicación idempotente
+  string event_id = 1;
+
+  // Código de la tienda socia emisora (ej. "NODE_ATR_DILAN")
+  string service_id = 2;
+
+  // ID de la atracción o tour
+  string item_id = 3;
+
+  // Fecha del turno (YYYY-MM-DD)
+  string date = 4;
+
+  // Franja horaria (ej. "10:30 a.m.")
+  string time_slot = 5;
+
+  // Variación neta sobre el aforo actual (+1 cupo liberado / cancelado, -2 cupos vendidos)
+  int32 delta = 6;
+
+  // Timestamp Unix Epoch en milisegundos
+  int64 timestamp = 7;
+
+  // Identificador unívoco del turno (ej. "slot-20261025-1030")
+  string slot_id = 8;
+}
+
+// Resumen del procesamiento de un canal de streaming gRPC
+message StreamSummary {
+  // Total de eventos de variación delta procesados en la sesión
+  int32 total_events_processed = 1;
+
+  // true si Booking y la tienda se encuentran con estado sincronizado
+  bool is_synchronized = 2;
+
+  // Hash SHA-256 o token de control para verificación de integridad de inventario
+  string last_sync_hash = 3;
+}
+
+// Petición para consultar la disponibilidad de un turno específico
+message SlotAvailabilityRequest {
+  string service_id = 1;
+  string item_id = 2;
+  string date = 3;
+  string time_slot = 4;
+  string slot_id = 5;
+}
+
+// Respuesta a la consulta de disponibilidad de turno
+message SlotAvailabilityResponse {
+  string item_id = 1;
+  string slot_id = 2;
+  string date = 3;
+  string time_slot = 4;
+  int32 available_units = 5;
+
+  // Estado operativo: "DISPONIBLE", "ULTIMOS_CUPOS", "AGOTADO"
+  string status = 6;
+
+  // Timestamp del último evento de sincronización registrado en Booking
+  int64 last_updated_epoch = 7;
+}
