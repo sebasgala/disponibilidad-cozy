@@ -1,0 +1,7 @@
+dist
+dist-test
+.env
+.env.*
+.git
+.github
+*.log

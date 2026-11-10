@@ -158,6 +158,14 @@ export async function llamarPuertoHttp<T>(
     throw reconstruirErrorPuerto(respuesta.status, parsed);
   }
   if (!texto || texto === 'null') return null as T;
-  return JSON.parse(texto) as T;
+  const contentType = (respuesta.headers.get('content-type') ?? '').toLowerCase();
+  if (contentType.includes('application/json')) {
+    try {
+      return JSON.parse(texto) as T;
+    } catch {
+      return texto as unknown as T;
+    }
+  }
+  return texto as unknown as T;
 }
 

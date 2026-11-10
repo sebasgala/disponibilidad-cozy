@@ -165,10 +165,14 @@ export class DisponibilidadPuertoHttp implements FuenteDisponibilidad {
     });
   }
 
-  confirmarRetencion(ordenId: string, habitacion: RefHabitacionStock | null, fechas: string[], correlacionId: string | null = null): Promise<ResultadoConfirmacion> {
-    return llamarPuertoHttp<ResultadoConfirmacion>(this.baseUrl, '/api/v1/interno/disponibilidad/cupos/confirmar', {
+  async confirmarRetencion(ordenId: string, habitacion: RefHabitacionStock | null, fechas: string[], correlacionId: string | null = null): Promise<ResultadoConfirmacion> {
+    const res = await llamarPuertoHttp<ResultadoConfirmacion | { resultado: ResultadoConfirmacion }>(this.baseUrl, '/api/v1/interno/disponibilidad/cupos/confirmar', {
       cuerpo: { ordenId, habitacion, fechas, correlacionId },
     });
+    if (typeof res === 'object' && res !== null && 'resultado' in res) {
+      return (res as { resultado: ResultadoConfirmacion }).resultado;
+    }
+    return res as ResultadoConfirmacion;
   }
 
   liberarCupos(ordenId: string): Promise<ResultadoLiberacion> {
