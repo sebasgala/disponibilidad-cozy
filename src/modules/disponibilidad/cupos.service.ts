@@ -99,7 +99,8 @@ export class CuposService {
     await manager
       .createQueryBuilder()
       .update(DisponibilidadDiaria)
-      .set({ cupos: () => `cupos + ${retencion.cantidad}` })
+      // Nunca por encima del stock real de la noche (si el admin redujo cuposTotales mientras la orden retenía)
+      .set({ cupos: () => `LEAST(cupos + ${retencion.cantidad}, "cuposTotales")` })
       .where('habitacionId = :habitacionId', { habitacionId: retencion.habitacionId })
       .andWhere('fecha >= :checkin AND fecha < :checkout', { checkin: retencion.checkin, checkout: retencion.checkout })
       .execute();

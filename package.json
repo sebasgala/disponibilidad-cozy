@@ -6,6 +6,7 @@
   "license": "UNLICENSED",
   "scripts": {
     "build": "tsc -p tsconfig.json",
+    "test": "node -e \"require('fs').rmSync('dist-test',{recursive:true,force:true})\" && tsc -p tsconfig.json --outDir dist-test --incremental false && node --test \"dist-test/**/*.spec.js\"",
     "start": "node dist/main.js",
     "start:prod": "node dist/main.js"
   },

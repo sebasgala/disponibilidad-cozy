@@ -15,6 +15,8 @@ import { PlanTarifa } from './entities/plan-tarifa.entity';
 import { RestriccionDia } from './entities/restriccion-dia.entity';
 import { RetencionCupos } from './entities/retencion-cupos.entity';
 import { ConsumidorCatalogoWorker } from './v2/consumidor-catalogo.worker';
+import { ConsumidorReservasWorker } from './v2/consumidor-reservas.worker';
+import { InventarioEventosService } from './v2/inventario-eventos.service';
 import { DisponibilidadV2Service } from './v2/disponibilidad-v2.service';
 import { InventarioV2Controller } from './v2/inventario-v2.controller';
 import { InventarioV2Service } from './v2/inventario-v2.service';
@@ -41,6 +43,8 @@ import { CONEXION } from '../../database/conexiones';
     StockOutboxService,
     StockEnvioWorker,
     ConsumidorCatalogoWorker,
+    InventarioEventosService,
+    ConsumidorReservasWorker,
     VencimientoRetencionesWorker,
     LimpiezaDisponibilidadService,
     PlanesAdminService,
