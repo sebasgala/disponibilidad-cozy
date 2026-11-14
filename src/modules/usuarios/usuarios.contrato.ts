@@ -5,4 +5,4 @@ import { RolUsuario, Usuario } from './entities/usuario.entity';
 // Fase 8.1: estos datos salen del token (id, rol y estado, vida de 10 minutos); no se lee la base en cada petición.
 export { RolUsuario };
 
-export type UsuarioSesion = Pick<Usuario, 'id' | 'rol'>;
+export type UsuarioSesion = Pick<Usuario, 'id' | 'rol' | 'alojamientoId'>;

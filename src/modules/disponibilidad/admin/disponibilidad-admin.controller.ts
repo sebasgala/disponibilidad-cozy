@@ -38,6 +38,7 @@ export class DisponibilidadAdminController {
   constructor(private readonly disponibilidadAdminService: DisponibilidadAdminService) {}
 
   @Get()
+  @Roles(RolUsuario.RECEPCION, RolUsuario.ADMINISTRADOR, RolUsuario.SUPERADMIN)
   @ApiOperation({ summary: 'Listar disponibilidad y precios por rango de fechas', description: 'desde y hasta incluidos, máximo 366 días.' })
   @ApiParam({ name: 'id', format: 'uuid', description: 'Habitación' })
   @ApiResponse({ status: 200, description: 'Días con fila en el rango', type: DisponibilidadAdminResponseDto })

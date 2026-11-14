@@ -59,7 +59,7 @@ describe('token de la cuenta (fase 8.1)', () => {
     const { access_token } = await auth.renovar(ID);
     assert.equal(lecturas.n, 1); // la renovación sí la lee
     const sesion = await auth.sesionDelToken(bearer(access_token));
-    assert.deepEqual(sesion, { id: ID, rol: RolUsuario.CLIENTE, estado: EstadoUsuario.ACTIVO });
+    assert.deepEqual(sesion, { id: ID, rol: RolUsuario.CLIENTE, estado: EstadoUsuario.ACTIVO, alojamientoId: null });
     assert.equal(lecturas.n, 1); // validar no agregó ninguna lectura
   });
 
@@ -151,7 +151,7 @@ describe('token de la cuenta (fase 8.1)', () => {
     assert.equal(cabeceraJwt.alg, 'RS256');
 
     const sesion = await authOtroModulo.sesionDelToken(bearer(access_token));
-    assert.deepEqual(sesion, { id: ID, rol: RolUsuario.ADMINISTRADOR, estado: EstadoUsuario.ACTIVO });
+    assert.deepEqual(sesion, { id: ID, rol: RolUsuario.ADMINISTRADOR, estado: EstadoUsuario.ACTIVO, alojamientoId: null });
 
     // Un módulo que solo verifica no tiene clave privada y no puede emitir tokens
     await assert.rejects(() => jwtOtroModulo.signAsync({ sub: ID, rol: 'cliente', estado: 'activo' }));

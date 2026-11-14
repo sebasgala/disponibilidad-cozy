@@ -2,6 +2,7 @@ import { Column, CreateDateColumn, Entity, PrimaryGeneratedColumn, UpdateDateCol
 
 export enum RolUsuario {
   CLIENTE = 'cliente',
+  RECEPCION = 'recepcion',
   ADMINISTRADOR = 'administrador',
   SUPERADMIN = 'superadmin',
 }
@@ -39,6 +40,9 @@ export class Usuario {
   // Los administradores nacen 'pendiente' hasta que el superadmin los aprueba; los clientes nacen 'activo'.
   @Column({ type: 'enum', enum: EstadoUsuario, default: EstadoUsuario.ACTIVO })
   estado: EstadoUsuario;
+
+  @Column({ type: 'int', nullable: true })
+  alojamientoId: number | null;
 
   @CreateDateColumn({ type: 'timestamptz' })
   createdAt: Date;

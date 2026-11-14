@@ -78,7 +78,12 @@ export class AuthService {
 
   // Token nuevo con el rol y el estado de la cuenta (login y renovación)
   private async sesionNueva(usuario: Usuario): Promise<LoginResponseDto> {
-    const access_token = await this.jwtService.signAsync({ sub: usuario.id, rol: usuario.rol, estado: usuario.estado } satisfies CargaJwt);
+    const access_token = await this.jwtService.signAsync({
+      sub: usuario.id,
+      rol: usuario.rol,
+      estado: usuario.estado,
+      alojamientoId: usuario.alojamientoId ?? null,
+    } satisfies CargaJwt);
     return { access_token, token_type: 'Bearer', expires_in: SEGUNDOS_DE_VIGENCIA, usuario: this.aRespuesta(usuario) };
   }
 
@@ -99,11 +104,22 @@ export class AuthService {
     // Un token anterior a la fase 8.1 (solo `sub`) o con datos que no existen no sirve
     const rolesValidos: string[] = Object.values(RolUsuario);
     const estadosValidos: string[] = Object.values(EstadoUsuario);
-    if (typeof carga?.sub !== 'string' || !ES_UUID.test(carga.sub) || !rolesValidos.includes(carga.rol) || !estadosValidos.includes(carga.estado)) {
+    const alojamientoId = carga?.alojamientoId ?? null;
+    const alojamientoValido = alojamientoId === null || (Number.isInteger(alojamientoId) && alojamientoId > 0);
+    if (
+      typeof carga?.sub !== 'string' ||
+      !ES_UUID.test(carga.sub) ||
+      !rolesValidos.includes(carga.rol) ||
+      !estadosValidos.includes(carga.estado) ||
+      !alojamientoValido
+    ) {
+      throw new NoAutenticadoException('El token no es válido o venció: inicia sesión de nuevo');
+    }
+    if (carga.rol === RolUsuario.RECEPCION && alojamientoId === null) {
       throw new NoAutenticadoException('El token no es válido o venció: inicia sesión de nuevo');
     }
     this.exigirCuentaActiva(carga);
-    return { id: carga.sub, rol: carga.rol, estado: carga.estado };
+    return { id: carga.sub, rol: carga.rol, estado: carga.estado, alojamientoId };
   }
 
   // Para las rutas del contrato, que no exigen login: si llega un token válido de una cuenta activa se usa

@@ -8,6 +8,7 @@ export interface SesionJwt {
   id: string;
   rol: RolUsuario;
   estado: EstadoUsuario;
+  alojamientoId: number | null;
 }
 
 // Petición ya autenticada: JwtAuthGuard deja aquí la sesión que trae el token.
@@ -21,4 +22,5 @@ export interface CargaJwt {
   sub: string;
   rol: RolUsuario;
   estado: EstadoUsuario;
+  alojamientoId?: number | null;
 }
